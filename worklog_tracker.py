@@ -167,7 +167,7 @@ def build_slack_message(person_data, date_str, active_issues=None):
     missing_seconds = (8 * 3600) - person_data["total_seconds"]
 
     lines = [
-        f":wave: Szia! A mai napra ({date_str}) *{format_hours(person_data['total_seconds'])}* van logolva a Jirában.",
+        f":wave: Szia! *{date_str}* napra összesen *{format_hours(person_data['total_seconds'])}* van logolva a Jirában.",
         f"*{format_hours(missing_seconds)}* hiányzik a 8 órából.",
     ]
 
