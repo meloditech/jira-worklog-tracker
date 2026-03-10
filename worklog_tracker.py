@@ -30,19 +30,22 @@ def get_jira_worklogs(base_url, email, api_token, date_str):
 
     # Search for issues with worklogs on the target date
     jql = f'worklogDate = "{date_str}"'
-    start_at = 0
     max_results = 100
     all_issues = []
+    next_page_token = None
 
     while True:
+        body = {
+            "jql": jql,
+            "maxResults": max_results,
+            "fields": ["key", "summary"],
+        }
+        if next_page_token:
+            body["nextPageToken"] = next_page_token
+
         response = requests.post(
             f"{base_url}/rest/api/3/search/jql",
-            json={
-                "jql": jql,
-                "startAt": start_at,
-                "maxResults": max_results,
-                "fields": ["key", "summary"],
-            },
+            json=body,
             auth=auth,
             headers={**headers, "Content-Type": "application/json"},
         )
@@ -52,9 +55,9 @@ def get_jira_worklogs(base_url, email, api_token, date_str):
         data = response.json()
         all_issues.extend(data["issues"])
 
-        if start_at + max_results >= data["total"]:
+        next_page_token = data.get("nextPageToken")
+        if not next_page_token:
             break
-        start_at += max_results
 
     print(f"Found {len(all_issues)} issues with worklogs on {date_str}")
 
