@@ -107,6 +107,43 @@ def get_jira_worklogs(base_url, email, api_token, date_str):
     return people
 
 
+def get_active_issues(base_url, email, api_token, account_id):
+    """Fetch issues assigned to a user that are In Progress or To Do."""
+    auth = (email, api_token)
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+
+    jql = f'assignee = "{account_id}" AND statusCategory IN ("To Do", "In Progress") ORDER BY status ASC'
+    all_issues = []
+    next_page_token = None
+
+    while True:
+        body = {
+            "jql": jql,
+            "maxResults": 50,
+            "fields": ["key", "summary", "status"],
+        }
+        if next_page_token:
+            body["nextPageToken"] = next_page_token
+
+        response = requests.post(
+            f"{base_url}/rest/api/3/search/jql",
+            json=body,
+            auth=auth,
+            headers=headers,
+        )
+        if not response.ok:
+            print(f"Jira active issues error {response.status_code}: {response.text}")
+            return []
+        data = response.json()
+        all_issues.extend(data["issues"])
+
+        next_page_token = data.get("nextPageToken")
+        if not next_page_token:
+            break
+
+    return all_issues
+
+
 def format_hours(seconds):
     """Format seconds as hours and minutes."""
     hours = seconds // 3600
@@ -116,22 +153,44 @@ def format_hours(seconds):
     return f"{hours}h {minutes}m"
 
 
-def build_slack_message(person_data, date_str):
+def build_slack_message(person_data, date_str, active_issues=None):
     """Build a Slack message for someone with < 8 hours."""
-    total_hours = person_data["total_seconds"] / 3600
     missing_seconds = (8 * 3600) - person_data["total_seconds"]
 
     lines = [
         f":wave: Szia! A mai napra ({date_str}) *{format_hours(person_data['total_seconds'])}* van logolva a Jirában.",
         f"*{format_hours(missing_seconds)}* hiányzik a 8 órából.",
-        "",
-        "*Logolt munkák:*",
     ]
 
-    for ticket_key, ticket_data in person_data["tickets"].items():
-        lines.append(
-            f"  • `{ticket_key}` {ticket_data['summary']} — {format_hours(ticket_data['seconds'])}"
-        )
+    if person_data["tickets"]:
+        lines.append("")
+        lines.append("*Logolt munkák:*")
+        for ticket_key, ticket_data in person_data["tickets"].items():
+            lines.append(
+                f"  • `{ticket_key}` {ticket_data['summary']} — {format_hours(ticket_data['seconds'])}"
+            )
+
+    if active_issues:
+        in_progress = []
+        todo = []
+        for issue in active_issues:
+            key = issue["key"]
+            summary = issue["fields"]["summary"]
+            category = issue["fields"]["status"]["statusCategory"]["name"]
+            entry = f"  • `{key}` {summary}"
+            if category == "In Progress":
+                in_progress.append(entry)
+            else:
+                todo.append(entry)
+
+        if in_progress:
+            lines.append("")
+            lines.append("*In Progress feladatok:*")
+            lines.extend(in_progress)
+        if todo:
+            lines.append("")
+            lines.append("*To Do feladatok:*")
+            lines.extend(todo)
 
     lines.append("")
     lines.append("Kérlek pótold a hiányzó órákat! :pray:")
@@ -219,16 +278,14 @@ def main():
             continue
 
         # Less than 8 hours - send notification
+        active_issues = get_active_issues(jira_base_url, jira_email, jira_api_token, jira_id)
         if person:
             name = person["name"]
-            message = build_slack_message(person, date_str)
+            message = build_slack_message(person, date_str, active_issues)
         else:
             name = jira_id
-            message = (
-                f":wave: Szia! A mai napra ({date_str}) *0h* van logolva a Jirában.\n"
-                f"*8h* hiányzik a 8 órából.\n\n"
-                f"Kérlek logold a munkádat! :pray:"
-            )
+            person_data = {"total_seconds": 0, "tickets": {}}
+            message = build_slack_message(person_data, date_str, active_issues)
 
         print(f"\n{name}: {format_hours(total_seconds)} - UNDER 8h")
         send_slack_dm(slack_client, slack_id, message, dry_run=args.dry_run)
