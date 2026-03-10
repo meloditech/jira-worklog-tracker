@@ -46,6 +46,8 @@ def get_jira_worklogs(base_url, email, api_token, date_str):
             auth=auth,
             headers={**headers, "Content-Type": "application/json"},
         )
+        if not response.ok:
+            print(f"Jira search error {response.status_code}: {response.text}")
         response.raise_for_status()
         data = response.json()
         all_issues.extend(data["issues"])
