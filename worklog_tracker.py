@@ -9,7 +9,7 @@ import json
 import os
 import ssl
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import certifi
 import requests
@@ -167,7 +167,7 @@ def build_slack_message(person_data, date_str, active_issues=None):
     missing_seconds = (8 * 3600) - person_data["total_seconds"]
 
     lines = [
-        f":wave: Szia! *{date_str}* napra összesen *{format_hours(person_data['total_seconds'])}* van logolva a Jirában.",
+        f":wave: Szia! Tegnapi napra (*{date_str}*) összesen *{format_hours(person_data['total_seconds'])}* van logolva a Jirában.",
         f"*{format_hours(missing_seconds)}* hiányzik a 8 órából.",
     ]
 
@@ -266,11 +266,19 @@ def main():
         print(f"Error parsing USER_MAPPING JSON: {e}")
         sys.exit(1)
 
-    # Target date
+    # Target date (default: previous workday — Mon→Fri, otherwise yesterday)
     if args.date:
         date_str = args.date
     else:
-        date_str = datetime.now().strftime("%Y-%m-%d")
+        today = date.today()
+        weekday = today.weekday()  # 0=Mon, 6=Sun
+        if weekday == 0:  # Monday → check Friday
+            target = today - timedelta(days=3)
+        elif weekday == 6:  # Sunday → check Friday
+            target = today - timedelta(days=2)
+        else:
+            target = today - timedelta(days=1)
+        date_str = target.strftime("%Y-%m-%d")
 
     # Project blacklist (optional, comma-separated)
     blacklist_str = os.environ.get("PROJECT_BLACKLIST", "")

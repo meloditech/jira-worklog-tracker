@@ -2,8 +2,8 @@ name: Jira Worklog Tracker
 
 on:
   schedule:
-    # Weekdays at 16:00 UTC = 17:00 CET / 18:00 CEST
-    - cron: '0 16 * * 1-5'
+    # Weekdays at 08:00 UTC = 09:00 CET / 10:00 CEST (checks previous workday)
+    - cron: '0 8 * * 1-5'
   workflow_dispatch:
 
 jobs:
