@@ -8,7 +8,7 @@ import argparse
 import json
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import requests
 from slack_sdk import WebClient
@@ -23,13 +23,16 @@ def get_env(name):
     return value
 
 
-def get_jira_worklogs(base_url, email, api_token, date_str):
+def get_jira_worklogs(base_url, email, api_token, date_str, blacklisted_projects=None):
     """Fetch all worklogs for the given date across all projects."""
     auth = (email, api_token)
     headers = {"Accept": "application/json"}
 
     # Search for issues with worklogs on the target date
     jql = f'worklogDate = "{date_str}"'
+    if blacklisted_projects:
+        excluded = ", ".join(f'"{p}"' for p in blacklisted_projects)
+        jql += f" AND project NOT IN ({excluded})"
     max_results = 100
     all_issues = []
     next_page_token = None
@@ -107,12 +110,16 @@ def get_jira_worklogs(base_url, email, api_token, date_str):
     return people
 
 
-def get_active_issues(base_url, email, api_token, account_id):
+def get_active_issues(base_url, email, api_token, account_id, blacklisted_projects=None):
     """Fetch issues assigned to a user that are In Progress or To Do."""
     auth = (email, api_token)
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
 
-    jql = f'assignee = "{account_id}" AND statusCategory IN ("To Do", "In Progress") ORDER BY status ASC'
+    jql = f'assignee = "{account_id}" AND statusCategory IN ("To Do", "In Progress")'
+    if blacklisted_projects:
+        excluded = ", ".join(f'"{p}"' for p in blacklisted_projects)
+        jql += f" AND project NOT IN ({excluded})"
+    jql += " ORDER BY status ASC"
     all_issues = []
     next_page_token = None
 
@@ -120,7 +127,7 @@ def get_active_issues(base_url, email, api_token, account_id):
         body = {
             "jql": jql,
             "maxResults": 50,
-            "fields": ["key", "summary", "status"],
+            "fields": ["key", "summary", "status", "duedate"],
         }
         if next_page_token:
             body["nextPageToken"] = next_page_token
@@ -172,25 +179,37 @@ def build_slack_message(person_data, date_str, active_issues=None):
 
     if active_issues:
         in_progress = []
-        todo = []
+        with_deadline = []
+        today = date.today()
+
         for issue in active_issues:
             key = issue["key"]
             summary = issue["fields"]["summary"]
             category = issue["fields"]["status"]["statusCategory"]["name"]
-            entry = f"  • `{key}` {summary}"
+            duedate = issue["fields"].get("duedate")
+
             if category == "In Progress":
-                in_progress.append(entry)
-            else:
-                todo.append(entry)
+                in_progress.append(f"  • `{key}` {summary}")
+
+            if duedate:
+                due = date.fromisoformat(duedate)
+                days_left = (due - today).days
+                if days_left < 0:
+                    days_str = f":rotating_light: *{abs(days_left)} napja lejárt!*"
+                elif days_left == 0:
+                    days_str = ":warning: *ma!*"
+                else:
+                    days_str = f"{days_left} nap múlva"
+                with_deadline.append(f"  • `{key}` {summary} — határidő: {duedate} ({days_str})")
 
         if in_progress:
             lines.append("")
             lines.append("*In Progress feladatok:*")
             lines.extend(in_progress)
-        if todo:
+        if with_deadline:
             lines.append("")
-            lines.append("*To Do feladatok:*")
-            lines.extend(todo)
+            lines.append("*Határidős feladatok:*")
+            lines.extend(with_deadline)
 
     lines.append("")
     lines.append("Kérlek pótold a hiányzó órákat! :pray:")
@@ -251,10 +270,16 @@ def main():
     else:
         date_str = datetime.now().strftime("%Y-%m-%d")
 
+    # Project blacklist (optional, comma-separated)
+    blacklist_str = os.environ.get("PROJECT_BLACKLIST", "")
+    blacklisted_projects = [p.strip() for p in blacklist_str.split(",") if p.strip()] if blacklist_str else []
+    if blacklisted_projects:
+        print(f"Blacklisted projects: {', '.join(blacklisted_projects)}")
+
     print(f"Checking worklogs for {date_str}...")
 
     # Fetch worklogs from Jira
-    people = get_jira_worklogs(jira_base_url, jira_email, jira_api_token, date_str)
+    people = get_jira_worklogs(jira_base_url, jira_email, jira_api_token, date_str, blacklisted_projects)
 
     print(f"\nFound {len(people)} people with worklogs:")
     for account_id, data in people.items():
@@ -278,7 +303,7 @@ def main():
             continue
 
         # Less than 8 hours - send notification
-        active_issues = get_active_issues(jira_base_url, jira_email, jira_api_token, jira_id)
+        active_issues = get_active_issues(jira_base_url, jira_email, jira_api_token, jira_id, blacklisted_projects)
         if person:
             name = person["name"]
             message = build_slack_message(person, date_str, active_issues)
