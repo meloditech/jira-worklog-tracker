@@ -35,16 +35,16 @@ def get_jira_worklogs(base_url, email, api_token, date_str):
     all_issues = []
 
     while True:
-        response = requests.get(
-            f"{base_url}/rest/api/3/search",
-            params={
+        response = requests.post(
+            f"{base_url}/rest/api/3/search/jql",
+            json={
                 "jql": jql,
                 "startAt": start_at,
                 "maxResults": max_results,
-                "fields": "key,summary",
+                "fields": ["key", "summary"],
             },
             auth=auth,
-            headers=headers,
+            headers={**headers, "Content-Type": "application/json"},
         )
         response.raise_for_status()
         data = response.json()
