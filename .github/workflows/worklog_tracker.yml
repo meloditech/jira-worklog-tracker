@@ -4,7 +4,14 @@ on:
   schedule:
     # Weekdays at 08:00 UTC = 09:00 CET / 10:00 CEST (checks previous workday)
     - cron: '0 8 * * 1-5'
+    # Friday at 16:00 UTC = 17:00 CET / 18:00 CEST (weekly summary)
+    - cron: '0 16 * * 5'
   workflow_dispatch:
+    inputs:
+      weekly_summary:
+        description: 'Send weekly summary instead of daily check'
+        type: boolean
+        default: false
 
 jobs:
   check-worklogs:
@@ -20,7 +27,25 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run worklog tracker
+      - name: Determine run mode
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            HOUR=$(date -u +%H)
+            DAY=$(date -u +%u)
+            if [ "$DAY" = "5" ] && [ "$HOUR" -ge "15" ]; then
+              echo "weekly=true" >> $GITHUB_OUTPUT
+            else
+              echo "weekly=false" >> $GITHUB_OUTPUT
+            fi
+          elif [ "${{ inputs.weekly_summary }}" = "true" ]; then
+            echo "weekly=true" >> $GITHUB_OUTPUT
+          else
+            echo "weekly=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run daily worklog tracker
+        if: steps.mode.outputs.weekly != 'true'
         env:
           JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
@@ -29,3 +54,14 @@ jobs:
           USER_MAPPING: ${{ secrets.USER_MAPPING }}
           PROJECT_BLACKLIST: ${{ secrets.PROJECT_BLACKLIST }}
         run: python worklog_tracker.py
+
+      - name: Run weekly summary
+        if: steps.mode.outputs.weekly == 'true'
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          USER_MAPPING: ${{ secrets.USER_MAPPING }}
+          PROJECT_BLACKLIST: ${{ secrets.PROJECT_BLACKLIST }}
+        run: python worklog_tracker.py --weekly-summary

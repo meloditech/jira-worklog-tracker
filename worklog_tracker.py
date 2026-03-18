@@ -169,12 +169,12 @@ def build_slack_message(person_data, date_str, active_issues=None):
 
     if is_ok:
         lines = [
-            f":white_check_mark: Szia! Tegnapi napra (*{date_str}*) összesen *{format_hours(total)}* van logolva a Jirában. Szép munka!",
+            f":white_check_mark: Szia! Az előző munkanapra (*{date_str}*) összesen *{format_hours(total)}* van logolva a Jirában. Szép munka!",
         ]
     else:
         missing_seconds = (8 * 3600) - total
         lines = [
-            f":exclamation: Szia! Tegnapi napra (*{date_str}*) összesen *{format_hours(total)}* van logolva a Jirában.",
+            f":exclamation: Szia! Az előző munkanapra (*{date_str}*) összesen *{format_hours(total)}* van logolva a Jirában.",
             f"*{format_hours(missing_seconds)}* hiányzik a 8 órából.",
         ]
 
@@ -246,6 +246,122 @@ def send_slack_dm(slack_client, slack_user_id, message, dry_run=False):
         print(f"  Error sending DM to {slack_user_id}: {e.response['error']}")
 
 
+def get_weekly_worklogs(base_url, email, api_token, week_start, week_end, blacklisted_projects=None):
+    """Fetch worklogs for a full week (Mon-Fri). Returns per-person and per-project stats."""
+    auth = (email, api_token)
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+
+    jql = f'worklogDate >= "{week_start}" AND worklogDate <= "{week_end}"'
+    if blacklisted_projects:
+        excluded = ", ".join(f'"{p}"' for p in blacklisted_projects)
+        jql += f" AND project NOT IN ({excluded})"
+
+    all_issues = []
+    next_page_token = None
+
+    while True:
+        body = {"jql": jql, "maxResults": 100, "fields": ["key", "summary", "project"]}
+        if next_page_token:
+            body["nextPageToken"] = next_page_token
+        response = requests.post(
+            f"{base_url}/rest/api/3/search/jql", json=body, auth=auth, headers=headers,
+        )
+        response.raise_for_status()
+        data = response.json()
+        all_issues.extend(data["issues"])
+        next_page_token = data.get("nextPageToken")
+        if not next_page_token:
+            break
+
+    print(f"Found {len(all_issues)} issues with worklogs in week {week_start} - {week_end}")
+
+    # {account_id: {"name": str, "total_seconds": int, "daily": {date_str: seconds}, "projects": {project_name: seconds}}}
+    people = {}
+    # {project_name: {"total_seconds": int, "tickets": {key: {"summary": str, "seconds": int}}}}
+    projects = {}
+
+    start_dt = date.fromisoformat(week_start)
+    end_dt = date.fromisoformat(week_end)
+
+    for issue in all_issues:
+        issue_key = issue["key"]
+        issue_summary = issue["fields"]["summary"]
+        project_name = issue["fields"]["project"]["name"]
+
+        wl_response = requests.get(
+            f"{base_url}/rest/api/3/issue/{issue_key}/worklog",
+            auth=(email, api_token),
+            headers={"Accept": "application/json"},
+        )
+        wl_response.raise_for_status()
+        worklogs = wl_response.json().get("worklogs", [])
+
+        for wl in worklogs:
+            started_date = wl["started"][:10]
+            wl_date = date.fromisoformat(started_date)
+            if wl_date < start_dt or wl_date > end_dt:
+                continue
+
+            account_id = wl["author"]["accountId"]
+            display_name = wl["author"]["displayName"]
+            seconds = wl["timeSpentSeconds"]
+
+            if account_id not in people:
+                people[account_id] = {"name": display_name, "total_seconds": 0, "daily": {}, "projects": {}}
+            people[account_id]["total_seconds"] += seconds
+            people[account_id]["daily"][started_date] = people[account_id]["daily"].get(started_date, 0) + seconds
+            people[account_id]["projects"][project_name] = people[account_id]["projects"].get(project_name, 0) + seconds
+
+            if project_name not in projects:
+                projects[project_name] = {"total_seconds": 0, "tickets": {}}
+            projects[project_name]["total_seconds"] += seconds
+            if issue_key not in projects[project_name]["tickets"]:
+                projects[project_name]["tickets"][issue_key] = {"summary": issue_summary, "seconds": 0}
+            projects[project_name]["tickets"][issue_key]["seconds"] += seconds
+
+    return people, projects
+
+
+def build_weekly_summary_message(person_data, week_start, week_end):
+    """Build weekly summary Slack message for one person."""
+    total = person_data["total_seconds"]
+    expected = 5 * 8 * 3600  # 40h
+
+    lines = [
+        f":bar_chart: *Heti összesítő ({week_start} – {week_end})*",
+        f"Összesen logolt idő: *{format_hours(total)}* / {format_hours(expected)}",
+    ]
+
+    # Daily breakdown
+    lines.append("")
+    lines.append("*Napi bontás:*")
+    current = date.fromisoformat(week_start)
+    end = date.fromisoformat(week_end)
+    day_names = ["Hétfő", "Kedd", "Szerda", "Csütörtök", "Péntek"]
+    while current <= end:
+        ds = current.strftime("%Y-%m-%d")
+        day_seconds = person_data["daily"].get(ds, 0)
+        day_name = day_names[current.weekday()] if current.weekday() < 5 else current.strftime("%A")
+        icon = ":white_check_mark:" if day_seconds >= 8 * 3600 else ":x:"
+        lines.append(f"  {icon} {day_name} ({ds}): *{format_hours(day_seconds)}*")
+        current += timedelta(days=1)
+
+    # Per-project breakdown
+    if person_data["projects"]:
+        lines.append("")
+        lines.append("*Projektek szerinti bontás:*")
+        sorted_projects = sorted(person_data["projects"].items(), key=lambda x: x[1], reverse=True)
+        for proj_name, proj_seconds in sorted_projects:
+            lines.append(f"  • {proj_name}: *{format_hours(proj_seconds)}*")
+
+    if total < expected:
+        missing = expected - total
+        lines.append("")
+        lines.append(f":warning: *{format_hours(missing)}* hiányzik a heti 40 órából.")
+
+    return "\n".join(lines)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Jira Worklog Tracker")
     parser.add_argument(
@@ -258,6 +374,11 @@ def main():
         type=str,
         default=None,
         help="Date to check (YYYY-MM-DD format, defaults to today)",
+    )
+    parser.add_argument(
+        "--weekly-summary",
+        action="store_true",
+        help="Send weekly summary instead of daily check",
     )
     args = parser.parse_args()
 
@@ -294,6 +415,47 @@ def main():
     if blacklisted_projects:
         print(f"Blacklisted projects: {', '.join(blacklisted_projects)}")
 
+    # Initialize Slack client
+    ssl_context = ssl.create_default_context(cafile=certifi.where())
+    slack_client = WebClient(token=slack_bot_token, ssl=ssl_context)
+
+    if args.weekly_summary:
+        # Weekly summary mode — calculate Mon-Fri of the current week
+        today = date.today()
+        if args.date:
+            today = date.fromisoformat(args.date)
+        # Find Monday of this week
+        monday = today - timedelta(days=today.weekday())
+        friday = monday + timedelta(days=4)
+        week_start = monday.strftime("%Y-%m-%d")
+        week_end = friday.strftime("%Y-%m-%d")
+
+        print(f"Generating weekly summary for {week_start} - {week_end}...")
+
+        people, projects = get_weekly_worklogs(
+            jira_base_url, jira_email, jira_api_token, week_start, week_end, blacklisted_projects
+        )
+
+        print(f"\nWeekly totals:")
+        for account_id, data in people.items():
+            print(f"  {data['name']}: {format_hours(data['total_seconds'])}")
+
+        for jira_id, slack_id in user_mapping.items():
+            person = people.get(jira_id)
+            if person:
+                name = person["name"]
+                message = build_weekly_summary_message(person, week_start, week_end)
+            else:
+                name = jira_id
+                empty_data = {"total_seconds": 0, "daily": {}, "projects": {}}
+                message = build_weekly_summary_message(empty_data, week_start, week_end)
+
+            print(f"\n{name}: {format_hours(person['total_seconds'] if person else 0)}")
+            send_slack_dm(slack_client, slack_id, message, dry_run=args.dry_run)
+
+        print(f"\nWeekly summary sent to {len(user_mapping)} people.")
+        return
+
     print(f"Checking worklogs for {date_str}...")
 
     # Fetch worklogs from Jira
@@ -302,10 +464,6 @@ def main():
     print(f"\nFound {len(people)} people with worklogs:")
     for account_id, data in people.items():
         print(f"  {data['name']}: {format_hours(data['total_seconds'])}")
-
-    # Initialize Slack client
-    ssl_context = ssl.create_default_context(cafile=certifi.where())
-    slack_client = WebClient(token=slack_bot_token, ssl=ssl_context)
 
     # Check each mapped user
     notified = 0

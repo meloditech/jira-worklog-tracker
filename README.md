@@ -69,4 +69,11 @@ python worklog_tracker.py --dry-run
 
 ### Paraméterek
 - `--dry-run` — Csak kiírja az üzeneteket, nem küld Slack DM-et
-- `--date YYYY-MM-DD` — Adott napot ellenőriz (alapértelmezett: ma)
+- `--date YYYY-MM-DD` — Adott napot ellenőriz (alapértelmezett: előző munkanap)
+- `--weekly-summary` — Heti összesítőt küld (hétfőtől péntekig, projekt bontásban)
+
+### Heti összesítő
+Pénteken 17:00-kor automatikusan fut a heti összesítő, ami minden felhasználónak elküldi:
+- Napi bontás (hétfőtől péntekig)
+- Projekt szerinti időbontás
+- Összesített heti óraszám vs. 40h
