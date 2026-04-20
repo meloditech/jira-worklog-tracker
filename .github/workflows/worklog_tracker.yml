@@ -53,6 +53,7 @@ jobs:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           USER_MAPPING: ${{ secrets.USER_MAPPING }}
           PROJECT_BLACKLIST: ${{ secrets.PROJECT_BLACKLIST }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: python worklog_tracker.py
 
       - name: Run weekly summary
@@ -64,4 +65,5 @@ jobs:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           USER_MAPPING: ${{ secrets.USER_MAPPING }}
           PROJECT_BLACKLIST: ${{ secrets.PROJECT_BLACKLIST }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: python worklog_tracker.py --weekly-summary

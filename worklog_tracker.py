@@ -16,6 +16,16 @@ import requests
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
+try:
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build as google_build
+    from googleapiclient.errors import HttpError as GoogleHttpError
+    GOOGLE_AVAILABLE = True
+except ImportError:
+    GOOGLE_AVAILABLE = False
+
+GOOGLE_CALENDAR_SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
+
 
 def get_env(name):
     value = os.environ.get(name)
@@ -153,6 +163,113 @@ def get_active_issues(base_url, email, api_token, account_id, blacklisted_projec
     return all_issues
 
 
+def get_user_email(base_url, email, api_token, account_id):
+    """Look up a Jira user's email address by account ID."""
+    auth = (email, api_token)
+    headers = {"Accept": "application/json"}
+    response = requests.get(
+        f"{base_url}/rest/api/3/user",
+        params={"accountId": account_id},
+        auth=auth,
+        headers=headers,
+    )
+    if not response.ok:
+        print(f"Jira user lookup error for {account_id}: {response.status_code} {response.text}")
+        return None
+    return response.json().get("emailAddress")
+
+
+def build_calendar_service(service_account_info, user_email):
+    """Build a Google Calendar API client impersonating the given user."""
+    creds = service_account.Credentials.from_service_account_info(
+        service_account_info, scopes=GOOGLE_CALENDAR_SCOPES
+    ).with_subject(user_email)
+    return google_build("calendar", "v3", credentials=creds, cache_discovery=False)
+
+
+def get_ooo_events(service_account_info, user_email, start_date, end_date):
+    """
+    Fetch OoO events from Google Calendar for a date range (inclusive).
+
+    Returns dict with:
+      - vacation_seconds: total full-day OoO seconds (8h per day, clipped to range)
+      - vacation_days: list of date strings that were full-day OoO
+      - partial_events: list of {date, summary, seconds} for timed OoO events
+    """
+    result = {"vacation_seconds": 0, "vacation_days": [], "partial_events": []}
+    if not GOOGLE_AVAILABLE or not service_account_info or not user_email:
+        return result
+
+    try:
+        service = build_calendar_service(service_account_info, user_email)
+    except Exception as e:
+        print(f"  Google auth failed for {user_email}: {e}")
+        return result
+
+    start_dt = date.fromisoformat(start_date)
+    end_dt = date.fromisoformat(end_date)
+    # Calendar API window: [start 00:00, end+1 00:00) in UTC-ish. Use wide RFC3339 with Z.
+    time_min = datetime.combine(start_dt, datetime.min.time(), tzinfo=timezone.utc).isoformat()
+    time_max = datetime.combine(end_dt + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc).isoformat()
+
+    try:
+        page_token = None
+        events = []
+        while True:
+            resp = service.events().list(
+                calendarId=user_email,
+                eventTypes=["outOfOffice"],
+                timeMin=time_min,
+                timeMax=time_max,
+                singleEvents=True,
+                pageToken=page_token,
+            ).execute()
+            events.extend(resp.get("items", []))
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+    except GoogleHttpError as e:
+        print(f"  Calendar fetch failed for {user_email}: {e}")
+        return result
+    except Exception as e:
+        print(f"  Calendar fetch error for {user_email}: {e}")
+        return result
+
+    vacation_days_set = set()
+    for ev in events:
+        summary = ev.get("summary", "OoO")
+        start = ev.get("start", {})
+        end = ev.get("end", {})
+
+        if "date" in start:
+            # All-day event → vacation. Iterate each day in [start, end).
+            ev_start = date.fromisoformat(start["date"])
+            ev_end = date.fromisoformat(end["date"])  # exclusive
+            cur = max(ev_start, start_dt)
+            last = min(ev_end - timedelta(days=1), end_dt)
+            while cur <= last:
+                # Weekday only — weekends don't count as vacation for 8h requirement
+                if cur.weekday() < 5:
+                    vacation_days_set.add(cur.isoformat())
+                cur += timedelta(days=1)
+        elif "dateTime" in start:
+            # Timed event → partial OoO (appointment)
+            ev_start = datetime.fromisoformat(start["dateTime"].replace("Z", "+00:00"))
+            ev_end = datetime.fromisoformat(end["dateTime"].replace("Z", "+00:00"))
+            seconds = int((ev_end - ev_start).total_seconds())
+            if seconds <= 0:
+                continue
+            result["partial_events"].append({
+                "date": ev_start.date().isoformat(),
+                "summary": summary,
+                "seconds": seconds,
+            })
+
+    result["vacation_days"] = sorted(vacation_days_set)
+    result["vacation_seconds"] = len(vacation_days_set) * 8 * 3600
+    return result
+
+
 def format_hours(seconds):
     """Format seconds as hours and minutes."""
     hours = seconds // 3600
@@ -162,21 +279,45 @@ def format_hours(seconds):
     return f"{hours}h {minutes}m"
 
 
-def build_slack_message(person_data, date_str, active_issues=None):
+def build_slack_message(person_data, date_str, active_issues=None, ooo_info=None):
     """Build a Slack message with worklog summary."""
     total = person_data["total_seconds"]
-    is_ok = total >= 8 * 3600
+    vacation_seconds = 0
+    partial_today = []
+    if ooo_info:
+        is_vacation_day = date_str in ooo_info.get("vacation_days", [])
+        if is_vacation_day:
+            vacation_seconds = 8 * 3600
+        partial_today = [p for p in ooo_info.get("partial_events", []) if p["date"] == date_str]
 
-    if is_ok:
+    effective = total + vacation_seconds
+    is_ok = effective >= 8 * 3600
+
+    if vacation_seconds > 0 and total == 0:
         lines = [
-            f":white_check_mark: Szia! Az előző munkanapra (*{date_str}*) összesen *{format_hours(total)}* van logolva a Jirában. Szép munka!",
+            f":palm_tree: Szia! Az előző munkanap (*{date_str}*) szabadság volt. Jó pihenést! :sunny:",
         ]
+    elif is_ok:
+        if vacation_seconds > 0:
+            lines = [
+                f":white_check_mark: Szia! Az előző munkanapra (*{date_str}*) *{format_hours(total)}* van logolva + *{format_hours(vacation_seconds)}* szabadság. Rendben!",
+            ]
+        else:
+            lines = [
+                f":white_check_mark: Szia! Az előző munkanapra (*{date_str}*) összesen *{format_hours(total)}* van logolva a Jirában. Szép munka!",
+            ]
     else:
-        missing_seconds = (8 * 3600) - total
+        missing_seconds = (8 * 3600) - effective
         lines = [
             f":exclamation: Szia! Az előző munkanapra (*{date_str}*) összesen *{format_hours(total)}* van logolva a Jirában.",
             f"*{format_hours(missing_seconds)}* hiányzik a 8 órából.",
         ]
+
+    if partial_today:
+        lines.append("")
+        lines.append("*OoO események (munkanapba beszámítva):*")
+        for ev in partial_today:
+            lines.append(f"  • {ev['summary']} — {format_hours(ev['seconds'])}")
 
     if person_data["tickets"]:
         lines.append("")
@@ -322,15 +463,25 @@ def get_weekly_worklogs(base_url, email, api_token, week_start, week_end, blackl
     return people, projects
 
 
-def build_weekly_summary_message(person_data, week_start, week_end):
+def build_weekly_summary_message(person_data, week_start, week_end, ooo_info=None):
     """Build weekly summary Slack message for one person."""
     total = person_data["total_seconds"]
     expected = 5 * 8 * 3600  # 40h
+
+    vacation_days = set(ooo_info.get("vacation_days", [])) if ooo_info else set()
+    vacation_seconds = len(vacation_days) * 8 * 3600
+    partial_events = ooo_info.get("partial_events", []) if ooo_info else []
+    partial_by_day = {}
+    for ev in partial_events:
+        partial_by_day.setdefault(ev["date"], 0)
+        partial_by_day[ev["date"]] += ev["seconds"]
 
     lines = [
         f":bar_chart: *Heti összesítő ({week_start} – {week_end})*",
         f"Összesen logolt idő: *{format_hours(total)}* / {format_hours(expected)}",
     ]
+    if vacation_seconds:
+        lines.append(f"Szabadság: *{format_hours(vacation_seconds)}* ({len(vacation_days)} nap)")
 
     # Daily breakdown
     lines.append("")
@@ -342,8 +493,16 @@ def build_weekly_summary_message(person_data, week_start, week_end):
         ds = current.strftime("%Y-%m-%d")
         day_seconds = person_data["daily"].get(ds, 0)
         day_name = day_names[current.weekday()] if current.weekday() < 5 else current.strftime("%A")
-        icon = ":white_check_mark:" if day_seconds >= 8 * 3600 else ":x:"
-        lines.append(f"  {icon} {day_name} ({ds}): *{format_hours(day_seconds)}*")
+        is_vacation = ds in vacation_days
+        if is_vacation:
+            icon = ":palm_tree:"
+            suffix = " (szabadság)"
+        else:
+            icon = ":white_check_mark:" if day_seconds >= 8 * 3600 else ":x:"
+            suffix = ""
+            if ds in partial_by_day:
+                suffix = f" (+{format_hours(partial_by_day[ds])} OoO)"
+        lines.append(f"  {icon} {day_name} ({ds}): *{format_hours(day_seconds)}*{suffix}")
         current += timedelta(days=1)
 
     # Per-project breakdown
@@ -354,8 +513,9 @@ def build_weekly_summary_message(person_data, week_start, week_end):
         for proj_name, proj_seconds in sorted_projects:
             lines.append(f"  • {proj_name}: *{format_hours(proj_seconds)}*")
 
-    if total < expected:
-        missing = expected - total
+    effective = total + vacation_seconds
+    if effective < expected:
+        missing = expected - effective
         lines.append("")
         lines.append(f":warning: *{format_hours(missing)}* hiányzik a heti 40 órából.")
 
@@ -394,6 +554,19 @@ def main():
     except json.JSONDecodeError as e:
         print(f"Error parsing USER_MAPPING JSON: {e}")
         sys.exit(1)
+
+    # Optional: Google service account JSON for OoO event detection
+    google_sa_info = None
+    google_sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    if google_sa_json:
+        if not GOOGLE_AVAILABLE:
+            print("Warning: GOOGLE_SERVICE_ACCOUNT_JSON set but google libs not installed.")
+        else:
+            try:
+                google_sa_info = json.loads(google_sa_json)
+            except json.JSONDecodeError as e:
+                print(f"Error parsing GOOGLE_SERVICE_ACCOUNT_JSON: {e}")
+                sys.exit(1)
 
     # Target date (default: previous workday — Mon→Fri, otherwise yesterday)
     if args.date:
@@ -442,13 +615,20 @@ def main():
 
         for jira_id, slack_id in user_mapping.items():
             person = people.get(jira_id)
+
+            ooo_info = None
+            if google_sa_info:
+                user_email = get_user_email(jira_base_url, jira_email, jira_api_token, jira_id)
+                if user_email:
+                    ooo_info = get_ooo_events(google_sa_info, user_email, week_start, week_end)
+
             if person:
                 name = person["name"]
-                message = build_weekly_summary_message(person, week_start, week_end)
+                message = build_weekly_summary_message(person, week_start, week_end, ooo_info)
             else:
                 name = jira_id
                 empty_data = {"total_seconds": 0, "daily": {}, "projects": {}}
-                message = build_weekly_summary_message(empty_data, week_start, week_end)
+                message = build_weekly_summary_message(empty_data, week_start, week_end, ooo_info)
 
             print(f"\n{name}: {format_hours(person['total_seconds'] if person else 0)}")
             send_slack_dm(slack_client, slack_id, message, dry_run=args.dry_run)
@@ -472,19 +652,31 @@ def main():
     for jira_id, slack_id in user_mapping.items():
         person = people.get(jira_id)
         total_seconds = person["total_seconds"] if person else 0
-        is_ok = total_seconds >= 8 * 3600
 
         active_issues = get_active_issues(jira_base_url, jira_email, jira_api_token, jira_id, blacklisted_projects)
+
+        ooo_info = None
+        if google_sa_info:
+            user_email = get_user_email(jira_base_url, jira_email, jira_api_token, jira_id)
+            if user_email:
+                ooo_info = get_ooo_events(google_sa_info, user_email, date_str, date_str)
+
+        vacation_seconds = 0
+        if ooo_info and date_str in ooo_info.get("vacation_days", []):
+            vacation_seconds = 8 * 3600
+        is_ok = (total_seconds + vacation_seconds) >= 8 * 3600
+
         if person:
             name = person["name"]
-            message = build_slack_message(person, date_str, active_issues)
+            message = build_slack_message(person, date_str, active_issues, ooo_info)
         else:
             name = jira_id
             person_data = {"total_seconds": 0, "tickets": {}}
-            message = build_slack_message(person_data, date_str, active_issues)
+            message = build_slack_message(person_data, date_str, active_issues, ooo_info)
 
         status = "OK" if is_ok else "UNDER 8h"
-        print(f"\n{name}: {format_hours(total_seconds)} - {status}")
+        vac_note = f" (+{format_hours(vacation_seconds)} vacation)" if vacation_seconds else ""
+        print(f"\n{name}: {format_hours(total_seconds)}{vac_note} - {status}")
         send_slack_dm(slack_client, slack_id, message, dry_run=args.dry_run)
 
         if is_ok:

@@ -38,7 +38,22 @@ JSON formátumú mapping a Jira account ID-k és Slack user ID-k között:
 **Slack User ID megtalálása:**
 - Slack desktop → user profil → "..." menü → "Copy member ID"
 
-### 4. GitHub Secrets
+### 4. Google Calendar OoO (opcionális)
+
+Ha beállítod, a script lekéri minden user Google Calendar OoO eseményeit és beleszámolja a 8 órába:
+
+- **Egész napos OoO esemény** = szabadság → a nap 8 órája automatikusan be van számolva, nem küld warning-ot.
+- **Órás OoO esemény** (pl. orvos) = munkanap közbeni szünet → csak megjelenik az üzenetben, külön nem kompenzálja a 8 órát.
+
+Setup:
+1. Google Cloud Console → új projekt → enable "Google Calendar API".
+2. IAM & Admin → Service Accounts → új service account → Keys → "Create new key" (JSON). Lementeni.
+3. Google Workspace Admin → Security → Access and data control → API controls → Domain-wide delegation → "Add new".
+   - Client ID: a service account `client_id`-ja.
+   - OAuth scopes: `https://www.googleapis.com/auth/calendar.readonly`
+4. A user Jira email címe meg kell egyezzen a Google Workspace email címével (a script ezt használja impersonationhöz).
+
+### 5. GitHub Secrets
 
 A repo Settings → Secrets and variables → Actions → New repository secret:
 
@@ -49,6 +64,7 @@ A repo Settings → Secrets and variables → Actions → New repository secret:
 | `JIRA_API_TOKEN` | Jira API token | `ATATT3x...` |
 | `SLACK_BOT_TOKEN` | Slack bot token | `xoxb-...` |
 | `USER_MAPPING` | JSON mapping | `{"abc123": "U0123ABC"}` |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | Service account JSON (opcionális, OoO detection) | `{"type":"service_account",...}` |
 
 ## Futtatás
 
