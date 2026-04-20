@@ -2,10 +2,10 @@ name: Jira Worklog Tracker
 
 on:
   schedule:
-    # Weekdays at 08:00 UTC = 09:00 CET / 10:00 CEST (checks previous workday)
-    - cron: '0 8 * * 1-5'
-    # Friday at 16:00 UTC = 17:00 CET / 18:00 CEST (weekly summary)
-    - cron: '0 16 * * 5'
+    # Weekdays at 06:45 UTC (off-peak, ~10 min delay → delivery ~8:55 CEST / ~7:55 CET)
+    - cron: '45 6 * * 1-5'
+    # Friday at 14:45 UTC (off-peak → delivery ~17:00 CEST / ~16:00 CET)
+    - cron: '45 14 * * 5'
   workflow_dispatch:
     inputs:
       weekly_summary:
@@ -33,7 +33,7 @@ jobs:
           if [ "${{ github.event_name }}" = "schedule" ]; then
             HOUR=$(date -u +%H)
             DAY=$(date -u +%u)
-            if [ "$DAY" = "5" ] && [ "$HOUR" -ge "15" ]; then
+            if [ "$DAY" = "5" ] && [ "$HOUR" -ge "14" ]; then
               echo "weekly=true" >> $GITHUB_OUTPUT
             else
               echo "weekly=false" >> $GITHUB_OUTPUT
