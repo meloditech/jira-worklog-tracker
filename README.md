@@ -45,13 +45,60 @@ Ha beállítod, a script lekéri minden user Google Calendar OoO eseményeit és
 - **Egész napos OoO esemény** = szabadság → a nap 8 órája automatikusan be van számolva, nem küld warning-ot.
 - **Órás OoO esemény** (pl. orvos) = munkanap közbeni szünet → csak megjelenik az üzenetben, külön nem kompenzálja a 8 órát.
 
-Setup:
-1. Google Cloud Console → új projekt → enable "Google Calendar API".
-2. IAM & Admin → Service Accounts → új service account → Keys → "Create new key" (JSON). Lementeni.
-3. Google Workspace Admin → Security → Access and data control → API controls → Domain-wide delegation → "Add new".
-   - Client ID: a service account `client_id`-ja.
-   - OAuth scopes: `https://www.googleapis.com/auth/calendar.readonly`
-4. A user Jira email címe meg kell egyezzen a Google Workspace email címével (a script ezt használja impersonationhöz).
+#### A GOOGLE_SERVICE_ACCOUNT_JSON beszerzése
+
+Domain-wide delegation-t használunk: egy service account impersonál minden user-t a Workspace-ben és csak read-only a calendar. Egyszeri admin setup.
+
+**Előfeltétel:** Google Workspace admin hozzáférés a domainhez (pl. `melodi.com`).
+
+**1. Google Cloud projekt + Calendar API engedélyezés**
+
+1. Nyisd meg: https://console.cloud.google.com/
+2. Felső sáv → projekt választó → "New Project".
+   - Név: pl. `jira-worklog-tracker`
+   - Create.
+3. Váltsd át az új projektre.
+4. Bal menü → "APIs & Services" → "Library".
+5. Keresd meg: "Google Calendar API" → Enable.
+
+**2. Service account létrehozása**
+
+1. Bal menü → "IAM & Admin" → "Service Accounts" → "Create service account".
+2. Name: pl. `jira-worklog-calendar-reader`. Create and Continue.
+3. "Grant this service account access to project" — üresen lehet hagyni (nem kell project role). Continue → Done.
+4. A listából nyisd meg az új service account-ot.
+5. Fülek: **Details** → jegyezd fel az "Unique ID" mezőt (= `client_id`, ez kell a domain-wide delegation-hoz).
+6. Fül: **Keys** → "Add Key" → "Create new key" → JSON → Create.
+   - Letöltődik egy `*.json` fájl. **Ez a `GOOGLE_SERVICE_ACCOUNT_JSON` titka.**
+   - Ne commitold semmibe. Ez lesz a GitHub Secret értéke — a teljes fájl tartalma (nyitó `{` és záró `}` is).
+
+**3. Domain-wide delegation engedélyezés (Workspace admin)**
+
+1. Nyisd meg: https://admin.google.com (Workspace super admin-ként).
+2. Security → Access and data control → API controls.
+3. "Manage Domain Wide Delegation" → "Add new".
+4. **Client ID:** a service account Unique ID-ja (lásd 2.5. lépés).
+5. **OAuth scopes:** `https://www.googleapis.com/auth/calendar.readonly`
+6. Authorize.
+
+Ezután a service account bármely user calendarját olvashatja a domainben (csak read-only).
+
+**4. Email matching**
+
+A script a Jira user `emailAddress` mezőjét használja (Jira REST API `/user?accountId=`). Ennek meg kell egyeznie a Google Workspace email-lel. Ha eltér valaki (pl. alias), annál a user-nél az OoO lookup fail-el és nincs szabadság-beszámítás — a régi 8h warning logika érvényesül rá.
+
+**5. GitHub Secret hozzáadása**
+
+- Repo → Settings → Secrets and variables → Actions → New repository secret.
+- Name: `GOOGLE_SERVICE_ACCOUNT_JSON`
+- Secret: a letöltött JSON fájl **teljes tartalma** (copy-paste a fájlból).
+
+**Lokális teszt:**
+
+```bash
+export GOOGLE_SERVICE_ACCOUNT_JSON="$(cat path/to/service-account.json)"
+python worklog_tracker.py --dry-run
+```
 
 ### 5. GitHub Secrets
 
