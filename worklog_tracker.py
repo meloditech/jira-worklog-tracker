@@ -129,7 +129,7 @@ def get_active_issues(base_url, email, api_token, account_id, blacklisted_projec
         body = {
             "jql": jql,
             "maxResults": 50,
-            "fields": ["key", "summary", "status", "duedate"],
+            "fields": ["key", "summary", "status", "duedate", "issuetype"],
         }
         if next_page_token:
             body["nextPageToken"] = next_page_token
@@ -197,7 +197,7 @@ def build_slack_message(person_data, date_str, active_issues=None):
             category = issue["fields"]["status"]["statusCategory"]["name"]
             duedate = issue["fields"].get("duedate")
 
-            if category == "In Progress":
+            if category == "In Progress" and issue["fields"]["issuetype"]["name"] != "Epic":
                 in_progress.append(f"  • `{key}` {summary}")
 
             if duedate:
