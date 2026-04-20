@@ -17,6 +17,12 @@ from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
 try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+try:
     from google.oauth2 import service_account
     from googleapiclient.discovery import build as google_build
     from googleapiclient.errors import HttpError as GoogleHttpError
@@ -163,6 +169,49 @@ def get_active_issues(base_url, email, api_token, account_id, blacklisted_projec
     return all_issues
 
 
+EMAIL_DOMAIN_ALIASES = {
+    "meloditech.com": "bpdata.com",
+}
+
+
+def canonicalize_email(email_addr):
+    """Normalize to lowercase and remap legacy domains to their current one.
+
+    The company rebrand from meloditech.com to bpdata.com left users' identities
+    scattered across both domains in Jira/Slack/Google. For Google Calendar
+    impersonation (Workspace is on bpdata.com) and for --users email matching
+    we collapse the legacy domain to the current one.
+    """
+    if not email_addr:
+        return email_addr
+    addr = email_addr.strip().lower()
+    if "@" not in addr:
+        return addr
+    local, _, domain = addr.partition("@")
+    canonical_domain = EMAIL_DOMAIN_ALIASES.get(domain, domain)
+    return f"{local}@{canonical_domain}"
+
+
+def normalize_user_mapping(raw):
+    """Accept either {jira_id: "SLACK"} or {jira_id: {"slack":"SLACK","email":"..."}}.
+
+    Returns {jira_id: {"slack": str, "email": str | None}}.
+    """
+    out = {}
+    for jira_id, val in raw.items():
+        if isinstance(val, str):
+            out[jira_id] = {"slack": val, "email": None}
+        elif isinstance(val, dict):
+            slack_id = val.get("slack") or val.get("slack_id")
+            if not slack_id:
+                print(f"Warning: USER_MAPPING entry for {jira_id} missing 'slack' field")
+                continue
+            out[jira_id] = {"slack": slack_id, "email": val.get("email")}
+        else:
+            print(f"Warning: unexpected USER_MAPPING value for {jira_id}: {val!r}")
+    return out
+
+
 def get_user_email(base_url, email, api_token, account_id):
     """Look up a Jira user's email address by account ID."""
     auth = (email, api_token)
@@ -196,14 +245,15 @@ def get_ooo_events(service_account_info, user_email, start_date, end_date):
       - vacation_days: list of date strings that were full-day OoO
       - partial_events: list of {date, summary, seconds} for timed OoO events
     """
-    result = {"vacation_seconds": 0, "vacation_days": [], "partial_events": []}
+    result = {"vacation_seconds": 0, "vacation_days": [], "vacation_events": [], "partial_events": []}
     if not GOOGLE_AVAILABLE or not service_account_info or not user_email:
         return result
 
+    canonical_email = canonicalize_email(user_email)
     try:
-        service = build_calendar_service(service_account_info, user_email)
+        service = build_calendar_service(service_account_info, canonical_email)
     except Exception as e:
-        print(f"  Google auth failed for {user_email}: {e}")
+        print(f"  Google auth failed for {canonical_email}: {e}")
         return result
 
     start_dt = date.fromisoformat(start_date)
@@ -217,7 +267,7 @@ def get_ooo_events(service_account_info, user_email, start_date, end_date):
         events = []
         while True:
             resp = service.events().list(
-                calendarId=user_email,
+                calendarId=canonical_email,
                 eventTypes=["outOfOffice"],
                 timeMin=time_min,
                 timeMax=time_max,
@@ -229,10 +279,10 @@ def get_ooo_events(service_account_info, user_email, start_date, end_date):
             if not page_token:
                 break
     except GoogleHttpError as e:
-        print(f"  Calendar fetch failed for {user_email}: {e}")
+        print(f"  Calendar fetch failed for {canonical_email}: {e}")
         return result
     except Exception as e:
-        print(f"  Calendar fetch error for {user_email}: {e}")
+        print(f"  Calendar fetch error for {canonical_email}: {e}")
         return result
 
     vacation_days_set = set()
@@ -250,20 +300,39 @@ def get_ooo_events(service_account_info, user_email, start_date, end_date):
             while cur <= last:
                 # Weekday only — weekends don't count as vacation for 8h requirement
                 if cur.weekday() < 5:
-                    vacation_days_set.add(cur.isoformat())
+                    iso = cur.isoformat()
+                    vacation_days_set.add(iso)
+                    result["vacation_events"].append({"date": iso, "summary": summary})
                 cur += timedelta(days=1)
         elif "dateTime" in start:
-            # Timed event → partial OoO (appointment)
+            # Timed event → per-day split. Google multi-day OoO is sometimes
+            # stored as a single timed event spanning 24h/48h/... so walk each
+            # calendar day and classify by overlap.
             ev_start = datetime.fromisoformat(start["dateTime"].replace("Z", "+00:00"))
             ev_end = datetime.fromisoformat(end["dateTime"].replace("Z", "+00:00"))
-            seconds = int((ev_end - ev_start).total_seconds())
-            if seconds <= 0:
+            if ev_end <= ev_start:
                 continue
-            result["partial_events"].append({
-                "date": ev_start.date().isoformat(),
-                "summary": summary,
-                "seconds": seconds,
-            })
+            cur = ev_start
+            while cur < ev_end:
+                day = cur.date()
+                day_end_dt = datetime.combine(
+                    day + timedelta(days=1), datetime.min.time(), tzinfo=cur.tzinfo
+                )
+                seg_end = min(ev_end, day_end_dt)
+                seg_seconds = int((seg_end - cur).total_seconds())
+                if seg_seconds > 0 and start_dt <= day <= end_dt and day.weekday() < 5:
+                    iso = day.isoformat()
+                    if seg_seconds >= 6 * 3600:
+                        # Covers most/all of a working day → vacation
+                        vacation_days_set.add(iso)
+                        result["vacation_events"].append({"date": iso, "summary": summary})
+                    else:
+                        result["partial_events"].append({
+                            "date": iso,
+                            "summary": summary,
+                            "seconds": seg_seconds,
+                        })
+                cur = seg_end
 
     result["vacation_days"] = sorted(vacation_days_set)
     result["vacation_seconds"] = len(vacation_days_set) * 8 * 3600
@@ -283,10 +352,11 @@ def build_slack_message(person_data, date_str, active_issues=None, ooo_info=None
     """Build a Slack message with worklog summary."""
     total = person_data["total_seconds"]
     vacation_seconds = 0
+    vacation_today = []
     partial_today = []
     if ooo_info:
-        is_vacation_day = date_str in ooo_info.get("vacation_days", [])
-        if is_vacation_day:
+        vacation_today = [v for v in ooo_info.get("vacation_events", []) if v["date"] == date_str]
+        if date_str in ooo_info.get("vacation_days", []):
             vacation_seconds = 8 * 3600
         partial_today = [p for p in ooo_info.get("partial_events", []) if p["date"] == date_str]
 
@@ -313,11 +383,15 @@ def build_slack_message(person_data, date_str, active_issues=None, ooo_info=None
             f"*{format_hours(missing_seconds)}* hiányzik a 8 órából.",
         ]
 
-    if partial_today:
+    if vacation_today or partial_today:
         lines.append("")
-        lines.append("*OoO események (munkanapba beszámítva):*")
+        lines.append("*OoO események (Google Calendar):*")
+        for ev in vacation_today:
+            title = ev.get("summary") or "OoO"
+            lines.append(f"  :palm_tree: {title} — egész napos szabadság (8h beszámítva)")
         for ev in partial_today:
-            lines.append(f"  • {ev['summary']} — {format_hours(ev['seconds'])}")
+            title = ev.get("summary") or "OoO"
+            lines.append(f"  :clock: {title} — {format_hours(ev['seconds'])} (nem beszámítva)")
 
     if person_data["tickets"]:
         lines.append("")
@@ -513,6 +587,18 @@ def build_weekly_summary_message(person_data, week_start, week_end, ooo_info=Non
         for proj_name, proj_seconds in sorted_projects:
             lines.append(f"  • {proj_name}: *{format_hours(proj_seconds)}*")
 
+    # OoO events list
+    vacation_events = ooo_info.get("vacation_events", []) if ooo_info else []
+    if vacation_events or partial_events:
+        lines.append("")
+        lines.append("*OoO események (Google Calendar):*")
+        for ev in sorted(vacation_events, key=lambda x: x["date"]):
+            title = ev.get("summary") or "OoO"
+            lines.append(f"  :palm_tree: {ev['date']} — {title}")
+        for ev in sorted(partial_events, key=lambda x: x["date"]):
+            title = ev.get("summary") or "OoO"
+            lines.append(f"  :clock: {ev['date']} — {title} ({format_hours(ev['seconds'])})")
+
     effective = total + vacation_seconds
     if effective < expected:
         missing = expected - effective
@@ -533,14 +619,70 @@ def main():
         "--date",
         type=str,
         default=None,
-        help="Date to check (YYYY-MM-DD format, defaults to today)",
+        help="Date to check (YYYY-MM-DD format, defaults to previous workday)",
+    )
+    parser.add_argument(
+        "--today",
+        action="store_true",
+        help="Run against today's date instead of previous workday (debug).",
     )
     parser.add_argument(
         "--weekly-summary",
         action="store_true",
         help="Send weekly summary instead of daily check",
     )
+    parser.add_argument(
+        "--users",
+        nargs="+",
+        default=None,
+        metavar="EMAIL_OR_NAME",
+        help="Only send to these users. Values with '@' → exact match on Jira email; "
+             "values without '@' → exact match on Jira display name (case-insensitive). "
+             "Space- or comma-separated.",
+    )
+    parser.add_argument(
+        "--list-users",
+        action="store_true",
+        help="List USER_MAPPING entries with resolved Jira emails and exit.",
+    )
+    parser.add_argument(
+        "--list-ooo",
+        type=str,
+        default=None,
+        metavar="EMAIL_OR_SLACK_ID",
+        help="Diagnostic: list Google Calendar OoO events for a user. Accepts an email "
+             "(foo@bar.com) or Slack user ID (U...). Uses --days window (default 30).",
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=30,
+        help="Window size in days for --list-ooo (default: 30, centered on today).",
+    )
     args = parser.parse_args()
+
+    # Normalize --users: split comma-separated, classify by '@'
+    target_emails = set()
+    target_names = set()
+    if args.users:
+        raw = []
+        for item in args.users:
+            raw.extend(item.split(","))
+        for v in raw:
+            v = v.strip()
+            if not v:
+                continue
+            if "@" in v:
+                target_emails.add(canonicalize_email(v))
+            else:
+                target_names.add(v.lower())
+        if target_emails or target_names:
+            bits = []
+            if target_emails:
+                bits.append(f"emails={sorted(target_emails)}")
+            if target_names:
+                bits.append(f"names={sorted(target_names)} (case-insensitive exact match)")
+            print(f"Filtering to users: {'; '.join(bits)}")
 
     # Config from environment
     jira_base_url = get_env("JIRA_BASE_URL").rstrip("/")
@@ -550,10 +692,40 @@ def main():
     user_mapping_json = get_env("USER_MAPPING")
 
     try:
-        user_mapping = json.loads(user_mapping_json)
+        user_mapping_raw = json.loads(user_mapping_json)
     except json.JSONDecodeError as e:
         print(f"Error parsing USER_MAPPING JSON: {e}")
         sys.exit(1)
+    user_mapping = normalize_user_mapping(user_mapping_raw)
+
+    if args.list_users:
+        print(f"USER_MAPPING — {len(user_mapping)} entries:\n")
+        print(f"  {'Jira Account ID':<36}  {'Slack ID':<12}  {'Display Name':<30}  {'Configured email':<35}  Email (Jira API)")
+        print(f"  {'-'*36}  {'-'*12}  {'-'*30}  {'-'*35}  {'-'*40}")
+        auth = (jira_email, jira_api_token)
+        headers = {"Accept": "application/json"}
+        for jira_id, entry in user_mapping.items():
+            slack_id = entry["slack"]
+            cfg_email = entry.get("email") or "(none)"
+            addr = None
+            display = ""
+            resp = requests.get(
+                f"{jira_base_url}/rest/api/3/user",
+                params={"accountId": jira_id},
+                auth=auth,
+                headers=headers,
+            )
+            if resp.ok:
+                data = resp.json()
+                addr = data.get("emailAddress") or "(hidden by Jira privacy)"
+                display = data.get("displayName") or ""
+            else:
+                addr = f"(lookup failed: {resp.status_code})"
+            print(f"  {jira_id:<36}  {slack_id:<12}  {display:<30}  {cfg_email:<35}  {addr}")
+        print()
+        print("Note: Jira hides emailAddress unless the user's privacy setting allows it,")
+        print("or the API token owner has the 'View user email' permission.")
+        return
 
     # Optional: Google service account JSON for OoO event detection
     google_sa_info = None
@@ -568,9 +740,105 @@ def main():
                 print(f"Error parsing GOOGLE_SERVICE_ACCOUNT_JSON: {e}")
                 sys.exit(1)
 
+    if args.list_ooo:
+        if not google_sa_info:
+            print("Error: GOOGLE_SERVICE_ACCOUNT_JSON is required for --list-ooo.")
+            sys.exit(1)
+
+        value = args.list_ooo.strip()
+        if "@" in value:
+            target_email = canonicalize_email(value)
+        else:
+            ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+            sc = WebClient(token=slack_bot_token, ssl=ssl_ctx)
+            try:
+                info = sc.users_info(user=value)
+                target_email = canonicalize_email(info["user"]["profile"].get("email") or "")
+            except SlackApiError as e:
+                print(f"Slack users_info error for {value}: {e.response['error']}")
+                print("Hint: add 'users:read' and 'users:read.email' scopes to the bot token.")
+                sys.exit(1)
+            if not target_email:
+                print(f"Slack user {value} has no email in profile (or scope missing).")
+                sys.exit(1)
+            print(f"Resolved Slack {value} → {target_email}")
+
+        days = max(1, args.days)
+        anchor = date.fromisoformat(args.date) if args.date else date.today()
+        start = anchor - timedelta(days=days // 2)
+        end = anchor + timedelta(days=days - days // 2)
+        print(f"Fetching OoO events for {target_email} between {start} and {end}...")
+
+        ooo = get_ooo_events(google_sa_info, target_email, start.isoformat(), end.isoformat())
+        vacation_days = ooo.get("vacation_days", [])
+        partial_events = ooo.get("partial_events", [])
+
+        print()
+        print(f"Vacation (all-day OoO) days on weekdays: {len(vacation_days)}")
+        for d in vacation_days:
+            print(f"  :palm_tree: {d}")
+        print()
+        print(f"Partial (timed) OoO events: {len(partial_events)}")
+        for ev in partial_events:
+            print(f"  :clock: {ev['date']}  {format_hours(ev['seconds']):>6}  {ev['summary']}")
+        if not vacation_days and not partial_events:
+            print("No OoO events in window.")
+            print("Hint: check calendar sharing, eventType 'outOfOffice' creation, and domain-wide delegation.")
+        return
+
+    # Optional: filter user_mapping by email address and/or display name
+    if target_emails or target_names:
+        filtered = {}
+        matched_emails = set()
+        matched_names = set()
+        auth_jira = (jira_email, jira_api_token)
+        headers_jira = {"Accept": "application/json"}
+        for jira_id, entry in user_mapping.items():
+            resp = requests.get(
+                f"{jira_base_url}/rest/api/3/user",
+                params={"accountId": jira_id},
+                auth=auth_jira,
+                headers=headers_jira,
+            )
+            addr = ""
+            display = ""
+            if resp.ok:
+                data = resp.json()
+                addr = canonicalize_email(data.get("emailAddress") or "") or ""
+                display = (data.get("displayName") or "").lower()
+            # Configured email (from USER_MAPPING) also counts
+            cfg_addr = canonicalize_email(entry.get("email") or "") or ""
+
+            matched = False
+            if addr and addr in target_emails:
+                matched = True
+                matched_emails.add(addr)
+            if cfg_addr and cfg_addr in target_emails:
+                matched = True
+                matched_emails.add(cfg_addr)
+            if display and display in target_names:
+                matched = True
+                matched_names.add(display)
+            if matched:
+                filtered[jira_id] = entry
+
+        missing_emails = target_emails - matched_emails
+        missing_names = target_names - matched_names
+        if missing_emails:
+            print(f"Warning: no USER_MAPPING entry for emails: {', '.join(sorted(missing_emails))}")
+        if missing_names:
+            print(f"Warning: no USER_MAPPING entry for names: {', '.join(sorted(missing_names))}")
+        if not filtered:
+            print("No matching users after --users filter. Exiting.")
+            sys.exit(1)
+        user_mapping = filtered
+        print(f"Filtered to {len(user_mapping)} user(s).")
+
     # Target date (default: previous workday — Mon→Fri, otherwise yesterday)
     if args.date:
         date_str = args.date
+    elif args.today:
+        date_str = date.today().strftime("%Y-%m-%d")
     else:
         today = date.today()
         weekday = today.weekday()  # 0=Mon, 6=Sun
@@ -613,12 +881,21 @@ def main():
         for account_id, data in people.items():
             print(f"  {data['name']}: {format_hours(data['total_seconds'])}")
 
-        for jira_id, slack_id in user_mapping.items():
+        for jira_id, entry in user_mapping.items():
+            slack_id = entry["slack"]
             person = people.get(jira_id)
 
             ooo_info = None
             if google_sa_info:
-                user_email = get_user_email(jira_base_url, jira_email, jira_api_token, jira_id)
+                user_email = entry.get("email")
+                if not user_email:
+                    user_email = get_user_email(jira_base_url, jira_email, jira_api_token, jira_id)
+                if not user_email and slack_id:
+                    try:
+                        info = slack_client.users_info(user=slack_id)
+                        user_email = info["user"]["profile"].get("email")
+                    except SlackApiError as e:
+                        print(f"  Slack users_info fallback failed for {slack_id}: {e.response['error']}")
                 if user_email:
                     ooo_info = get_ooo_events(google_sa_info, user_email, week_start, week_end)
 
@@ -649,7 +926,8 @@ def main():
     notified = 0
     skipped = 0
 
-    for jira_id, slack_id in user_mapping.items():
+    for jira_id, entry in user_mapping.items():
+        slack_id = entry["slack"]
         person = people.get(jira_id)
         total_seconds = person["total_seconds"] if person else 0
 
@@ -657,9 +935,19 @@ def main():
 
         ooo_info = None
         if google_sa_info:
-            user_email = get_user_email(jira_base_url, jira_email, jira_api_token, jira_id)
+            user_email = entry.get("email")
+            if not user_email:
+                user_email = get_user_email(jira_base_url, jira_email, jira_api_token, jira_id)
+            if not user_email and slack_id:
+                try:
+                    info = slack_client.users_info(user=slack_id)
+                    user_email = info["user"]["profile"].get("email")
+                except SlackApiError as e:
+                    print(f"  Slack users_info fallback failed for {slack_id}: {e.response['error']}")
             if user_email:
                 ooo_info = get_ooo_events(google_sa_info, user_email, date_str, date_str)
+            else:
+                print(f"  No email resolvable for {jira_id} → skipping OoO fetch")
 
         vacation_seconds = 0
         if ooo_info and date_str in ooo_info.get("vacation_days", []):
