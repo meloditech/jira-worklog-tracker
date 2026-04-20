@@ -138,8 +138,62 @@ A repo Settings → Secrets and variables → Actions → New repository secret:
 
 ## Futtatás
 
-### Automatikus (GitHub Actions)
-Hétfőtől péntekig 17:00 CET-kor automatikusan fut. Kézzel is indítható: Actions → Jira Worklog Tracker → Run workflow.
+### Automatikus futtatás — Render Cron Jobs
+
+Az ütemezett futás **Render Cron Job**-okon keresztül történik (korábban GitHub Actions volt). A GitHub workflow megmarad, de csak manuális indításra (Actions → Jira Worklog Tracker → Run workflow).
+
+#### Render setup (manual UI)
+
+**Előfeltétel:** Render account (ingyenes is elég) + a repo (GitHub) hozzáférhető.
+
+**1. Új Cron Job létrehozása — napi check**
+
+1. https://dashboard.render.com/ → **New +** → **Cron Job**.
+2. Connect repo: válaszd ki a `jira-worklog-tracker` repo-t. Branch: `main` (vagy aminél telepíteni szeretnél).
+3. Beállítások:
+   - **Name:** `jira-worklog-daily`
+   - **Region:** Frankfurt (legközelebbi)
+   - **Runtime:** `Python`
+   - **Build Command:** `pip install -r requirements.txt`
+   - **Schedule:** `45 6 * * 1-5`  *(UTC! = 08:45 CEST / 07:45 CET, hétfő–péntek)*
+   - **Command:** `python worklog_tracker.py`
+4. **Environment Variables** — add hozzá az alábbiakat (mindegyik "Secret" típusú a Render-ben):
+   - `JIRA_BASE_URL`
+   - `JIRA_EMAIL`
+   - `JIRA_API_TOKEN`
+   - `SLACK_BOT_TOKEN`
+   - `USER_MAPPING`
+   - `PROJECT_BLACKLIST` *(opcionális)*
+   - `GOOGLE_SERVICE_ACCOUNT_JSON` *(opcionális, OoO detection)*
+
+   A `.env` fájlban lévő értékeket másold ide 1:1-ben (egy sorban a JSON-öket is).
+5. **Create Cron Job**. A Render legyártja a service-t, futtatja a build-et és várja a következő cron trigger-t.
+
+**2. Második Cron Job — heti összesítő**
+
+Ismételd meg a fenti lépéseket az alábbi eltérésekkel:
+
+- **Name:** `jira-worklog-weekly`
+- **Schedule:** `45 14 * * 5`  *(péntek 14:45 UTC = 16:45 CEST / 15:45 CET)*
+- **Command:** `python worklog_tracker.py --weekly-summary`
+- **Env vars:** ugyanazok mint a daily.
+
+Tipp: ha nem akarod mindegyik env var-t kétszer begépelni, használj Render **Environment Group**-ot:
+1. Dashboard → **Env Groups** → **New Environment Group** → add hozzá mind a 7 változót.
+2. A Cron Job-oknál Settings → Environment → **Link Environment Group**. Mindkét job ugyanazt a group-ot használja — egy helyen tartod karban.
+
+#### Első indítás / tesztelés
+
+- Minden Cron Job-nál a "Trigger Run" gomb elérhető a dashboard-on → azonnali one-shot futtatás.
+- A logok a **Logs** tab alatt élőben látszanak. A `Python` runtime nem hagy semmi state-et két futtatás között.
+
+#### Időzónák
+
+Render cron kifejezés **UTC**-ben van. Jelenlegi setup:
+- `45 6 * * 1-5` → hétfő–péntek 08:45 CEST / 07:45 CET (off-peak, gyors indulás)
+- `45 14 * * 5` → péntek 16:45 CEST / 15:45 CET
+
+DST átállásakor egy órát csúszik — ha szigorú lokális idő kell, rendszeresen ellenőrizd március/október végén.
 
 ### Lokális teszt
 

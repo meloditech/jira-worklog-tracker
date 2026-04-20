@@ -1,11 +1,8 @@
 name: Jira Worklog Tracker
 
+# Scheduled runs moved to Render Cron Jobs (see README → Deployment).
+# This workflow stays for manual dispatch (Actions → Run workflow).
 on:
-  schedule:
-    # Weekdays at 06:45 UTC (off-peak, ~10 min delay → delivery ~8:55 CEST / ~7:55 CET)
-    - cron: '45 6 * * 1-5'
-    # Friday at 14:45 UTC (off-peak → delivery ~17:00 CEST / ~16:00 CET)
-    - cron: '45 14 * * 5'
   workflow_dispatch:
     inputs:
       weekly_summary:
@@ -30,15 +27,7 @@ jobs:
       - name: Determine run mode
         id: mode
         run: |
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            HOUR=$(date -u +%H)
-            DAY=$(date -u +%u)
-            if [ "$DAY" = "5" ] && [ "$HOUR" -ge "14" ]; then
-              echo "weekly=true" >> $GITHUB_OUTPUT
-            else
-              echo "weekly=false" >> $GITHUB_OUTPUT
-            fi
-          elif [ "${{ inputs.weekly_summary }}" = "true" ]; then
+          if [ "${{ inputs.weekly_summary }}" = "true" ]; then
             echo "weekly=true" >> $GITHUB_OUTPUT
           else
             echo "weekly=false" >> $GITHUB_OUTPUT
