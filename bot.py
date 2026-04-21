@@ -73,6 +73,37 @@ _web_client = WebClient(token=SLACK_BOT_TOKEN, ssl=_ssl_ctx)
 app = App(token=SLACK_BOT_TOKEN, client=_web_client)
 
 
+# -- request logging -------------------------------------------------------
+
+def log_request(command):
+    """Print a one-line audit log for every slash command invocation."""
+    from datetime import datetime
+    ts = datetime.now().isoformat(timespec="seconds")
+    cmd = command.get("command", "?")
+    args = (command.get("text") or "").strip()
+    slack_id = command.get("user_id", "?")
+    slack_name = command.get("user_name", "?")
+    jid, entry = actor(slack_id)
+    if entry:
+        roles = "+".join(entry.get("roles", [])) or "worker"
+        who = f"{slack_id} ({slack_name}, jira={jid[:12]}…, roles={roles})"
+    else:
+        who = f"{slack_id} ({slack_name}, UNMAPPED)"
+    args_repr = f" {args}" if args else ""
+    print(f"[{ts}] {who} → {cmd}{args_repr}")
+
+
+@app.middleware
+def audit_middleware(body, next):
+    """Run before every listener. Logs slash commands; lets events pass through."""
+    if body.get("command"):
+        try:
+            log_request(body)
+        except Exception as e:
+            print(f"[audit] log error: {e}")
+    next()
+
+
 # -- permission helpers -----------------------------------------------------
 
 def actor(slack_user_id):
