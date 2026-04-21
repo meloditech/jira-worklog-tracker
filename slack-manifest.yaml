@@ -1,0 +1,77 @@
+# Slack App Manifest — paste into https://api.slack.com/apps/YOUR_APP_ID/app-manifest
+# (or use "Create New App" → "From an app manifest" on first install)
+#
+# This file is the single source of truth for the Slack app config:
+# scopes, slash commands, Socket Mode, bot display name. Updating the
+# manifest in the Slack UI replaces all six slash commands + scopes in
+# one click — no manual clicking through Features → Slash Commands.
+
+display_information:
+  name: Jira Worklog Tracker
+  description: Daily worklog reminders + PO/Management queries for BPData
+  background_color: "#1f2937"
+
+features:
+  bot_user:
+    display_name: Jira Worklog Tracker
+    always_online: true
+
+  app_home:
+    home_tab_enabled: false
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
+
+  slash_commands:
+    - command: /wl-help
+      description: Show all available worklog commands
+      usage_hint: " "
+      should_escape: false
+    - command: /wl-projects
+      description: List all Jira projects (with POs)
+      usage_hint: " "
+      should_escape: false
+    - command: /wl-me
+      description: Your logged time this week
+      usage_hint: " "
+      should_escape: false
+    - command: /wl-me-week
+      description: Your weekly log for a past week
+      usage_hint: "[last|YYYY-MM-DD]"
+      should_escape: false
+    - command: /wl-worker
+      description: "(Management) Query another worker's time"
+      usage_hint: "<name> [last|YYYY-MM-DD]"
+      should_escape: false
+    - command: /wl-project
+      description: "(PO/Management) Weekly report for a project"
+      usage_hint: "<PROJECT_KEY> [last|YYYY-MM-DD]"
+      should_escape: false
+    - command: /wl-subproject
+      description: "(PO/Management) Weekly report for an Epic"
+      usage_hint: "<EPIC-KEY> [last|YYYY-MM-DD]"
+      should_escape: false
+    - command: /wl-company
+      description: "(Management) Company-wide weekly report"
+      usage_hint: "[last|YYYY-MM-DD]"
+      should_escape: false
+
+oauth_config:
+  scopes:
+    bot:
+      - chat:write        # send DMs and messages
+      - im:write          # open DM channels
+      - im:history        # read DM history (required for message.im events)
+      - users:read        # list workspace users
+      - users:read.email  # resolve Slack ID → email for OoO fallback
+      - commands          # handle slash commands
+      - app_mentions:read # read @bot mentions in channels
+
+settings:
+  socket_mode_enabled: true
+  interactivity:
+    is_enabled: true
+  org_deploy_enabled: false
+  event_subscriptions:
+    bot_events:
+      - message.im        # enables the DM composer ("send a message" UI)
+      - app_mention       # allows @mentioning the bot in channels

@@ -192,24 +192,84 @@ def canonicalize_email(email_addr):
     return f"{local}@{canonical_domain}"
 
 
-def normalize_user_mapping(raw):
-    """Accept either {jira_id: "SLACK"} or {jira_id: {"slack":"SLACK","email":"..."}}.
+VALID_ROLES = {"worker", "product_owner", "management"}
 
-    Returns {jira_id: {"slack": str, "email": str | None}}.
+
+def _normalize_roles(raw_role):
+    """Accept string or list. Return list of valid roles (deduped)."""
+    if raw_role is None:
+        return ["worker"]
+    if isinstance(raw_role, str):
+        raw = [raw_role]
+    elif isinstance(raw_role, list):
+        raw = raw_role
+    else:
+        print(f"Warning: unexpected role value {raw_role!r}; defaulting to worker")
+        return ["worker"]
+    out = []
+    for r in raw:
+        r = (r or "").lower()
+        if r in VALID_ROLES and r not in out:
+            out.append(r)
+        elif r:
+            print(f"Warning: invalid role {r!r}; ignoring")
+    return out or ["worker"]
+
+
+def normalize_user_mapping(raw):
+    """Parse USER_MAPPING. Supports:
+       - legacy: {jira_id: "SLACK"}
+       - extended: {jira_id: {"slack": "SLACK", "email": "...",
+                              "role": "worker"|"product_owner"|"management"
+                                      | ["product_owner", "management"],
+                              "projects": ["LIP", "IN"]}}
+
+    Returns {jira_id: {"slack", "email", "roles": [..], "projects": [..]}}.
     """
     out = {}
     for jira_id, val in raw.items():
         if isinstance(val, str):
-            out[jira_id] = {"slack": val, "email": None}
+            out[jira_id] = {"slack": val, "email": None, "roles": ["worker"], "projects": []}
         elif isinstance(val, dict):
             slack_id = val.get("slack") or val.get("slack_id")
             if not slack_id:
                 print(f"Warning: USER_MAPPING entry for {jira_id} missing 'slack' field")
                 continue
-            out[jira_id] = {"slack": slack_id, "email": val.get("email")}
+            # Accept either 'role' (string/list) or 'roles' (list).
+            roles = _normalize_roles(val.get("roles") if "roles" in val else val.get("role"))
+            projects = val.get("projects") or []
+            if not isinstance(projects, list):
+                print(f"Warning: 'projects' for {jira_id} must be a list; got {projects!r}")
+                projects = []
+            out[jira_id] = {
+                "slack": slack_id,
+                "email": val.get("email"),
+                "roles": roles,
+                "projects": [p.upper() for p in projects if isinstance(p, str)],
+            }
         else:
             print(f"Warning: unexpected USER_MAPPING value for {jira_id}: {val!r}")
     return out
+
+
+def find_user_by_slack(user_mapping, slack_id):
+    """Reverse lookup: slack_id → (jira_id, entry) or (None, None)."""
+    for jira_id, entry in user_mapping.items():
+        if entry["slack"] == slack_id:
+            return jira_id, entry
+    return None, None
+
+
+def find_users_by_role(user_mapping, role):
+    """All entries that include the given role."""
+    return {jid: e for jid, e in user_mapping.items() if role in e["roles"]}
+
+
+def find_po_for_project(user_mapping, project_key):
+    """Find the PO(s) that own a project key."""
+    project_key = project_key.upper()
+    return [(jid, e) for jid, e in user_mapping.items()
+            if "product_owner" in e["roles"] and project_key in e["projects"]]
 
 
 def get_user_email(base_url, email, api_token, account_id):
@@ -632,6 +692,22 @@ def main():
         help="Send weekly summary instead of daily check",
     )
     parser.add_argument(
+        "--po-reports",
+        action="store_true",
+        help="Send weekly Product Owner reports (one DM per PO per owned project).",
+    )
+    parser.add_argument(
+        "--mgmt-reports",
+        action="store_true",
+        help="Send weekly Management reports (company-wide DM to each Management user).",
+    )
+    parser.add_argument(
+        "--last-week",
+        action="store_true",
+        help="Use previous week as anchor for --po-reports / --mgmt-reports / --weekly-summary. "
+             "Combine with --dry-run to preview.",
+    )
+    parser.add_argument(
         "--users",
         nargs="+",
         default=None,
@@ -860,11 +936,70 @@ def main():
     ssl_context = ssl.create_default_context(cafile=certifi.where())
     slack_client = WebClient(token=slack_bot_token, ssl=ssl_context)
 
+    if args.po_reports or args.mgmt_reports:
+        import reports  # lazy import — only needed for these modes
+        today = date.today()
+        if args.date:
+            today = date.fromisoformat(args.date)
+        if args.last_week:
+            today = today - timedelta(days=7)
+        week_start, week_end = reports.week_range(today)
+        print(f"Building reports for week {week_start} – {week_end}...")
+
+        # Collect project descriptions once
+        all_projects = reports.get_all_projects(jira_base_url, jira_email, jira_api_token)
+        project_desc_map = {p["key"]: p["description"] for p in all_projects}
+        project_name_map = {p["key"]: p["name"] for p in all_projects}
+
+        if args.po_reports:
+            pos = find_users_by_role(user_mapping, "product_owner")
+            print(f"Found {len(pos)} Product Owner(s).")
+            for po_jid, po in pos.items():
+                po_projects = [p for p in po.get("projects", []) if p not in blacklisted_projects]
+                if not po_projects:
+                    print(f"  PO {po_jid} has no projects; skipping.")
+                    continue
+                for project_key in po_projects:
+                    issues = reports.get_project_worklogs(
+                        jira_base_url, jira_email, jira_api_token,
+                        [project_key], week_start, week_end,
+                    )
+                    message = reports.build_project_report(
+                        project_key,
+                        project_name_map.get(project_key, project_key),
+                        project_desc_map.get(project_key, ""),
+                        issues, week_start, week_end,
+                    )
+                    print(f"\nPO {po['slack']}: project {project_key} ({len(issues)} issues)")
+                    send_slack_dm(slack_client, po["slack"], message, dry_run=args.dry_run)
+
+        if args.mgmt_reports:
+            mgmt_users = find_users_by_role(user_mapping, "management")
+            print(f"Found {len(mgmt_users)} Management user(s).")
+            # Gather all non-blacklisted project keys to scope the search
+            all_keys = [p["key"] for p in all_projects if p["key"] not in blacklisted_projects]
+            issues = reports.get_project_worklogs(
+                jira_base_url, jira_email, jira_api_token,
+                all_keys, week_start, week_end,
+            )
+            message = reports.build_company_report(
+                issues, week_start, week_end,
+                project_descriptions=project_desc_map,
+            )
+            for mgr_jid, mgr in mgmt_users.items():
+                print(f"\nManagement {mgr['slack']}: company-wide report")
+                send_slack_dm(slack_client, mgr["slack"], message, dry_run=args.dry_run)
+
+        print(f"\nLLM cache: {reports.llm_cache_stats()}")
+        return
+
     if args.weekly_summary:
         # Weekly summary mode — calculate Mon-Fri of the current week
         today = date.today()
         if args.date:
             today = date.fromisoformat(args.date)
+        if args.last_week:
+            today = today - timedelta(days=7)
         # Find Monday of this week
         monday = today - timedelta(days=today.weekday())
         friday = monday + timedelta(days=4)

@@ -1,6 +1,8 @@
 # Jira Worklog Tracker
 
-Napi bot, ami ellenőrzi a Jira worklogokat és Slack DM-ben értesíti azokat, akik nem logoltak 8 órát.
+Napi bot, ami ellenőrzi a Jira worklogokat és Slack DM-ben értesíti azokat, akik nem logoltak 8 órát. Heti riport + on-demand Slack bot (PO / Management queries) + AI-generated summaries.
+
+**Company process doc:** [docs/time-management.md](docs/time-management.md) — olvassák el új munkatársak.
 
 ## Hogyan működik
 
@@ -35,22 +37,52 @@ JSON formátumú mapping a Jira account ID-k és Slack user ID-k között. Két 
 {"jira_account_id_1": "SLACK_USER_ID_1", "jira_account_id_2": "SLACK_USER_ID_2"}
 ```
 
-**Kiterjesztett forma (ajánlott, ha Google Calendar OoO detection is kell):**
+**Kiterjesztett forma (ajánlott — email, role, projects):**
 
 ```json
 {
-  "jira_account_id_1": {"slack": "U07KUE09ULA", "email": "bence.bial@bpdata.com"},
-  "jira_account_id_2": {"slack": "U0123ABC", "email": "adam.nemes@bpdata.com"}
+  "jira_account_id_1": {
+    "slack": "U07KUE09ULA",
+    "email": "bence.bial@bpdata.com",
+    "role": "worker"
+  },
+  "jira_account_id_po": {
+    "slack": "U0123ABC",
+    "email": "po.name@bpdata.com",
+    "role": "product_owner",
+    "projects": ["LIP", "IN"]
+  },
+  "jira_account_id_mgmt": {
+    "slack": "U0456DEF",
+    "email": "ceo@bpdata.com",
+    "roles": ["management"]
+  },
+  "jira_account_id_po_mgmt": {
+    "slack": "U0789GHI",
+    "email": "founder@bpdata.com",
+    "roles": ["product_owner", "management"],
+    "projects": ["IN"]
+  }
 }
 ```
 
-Az `email` mező opcionális, de **erősen ajánlott** a Google Calendar OoO funkcióhoz:
+**Fields:**
+- `slack` (required) — Slack user ID.
+- `email` (optional, recommended) — Google Workspace email for Calendar OoO and fallback identity.
+- `roles` (optional, default `["worker"]`) — any subset of `worker`, `product_owner`, `management`. Accepts a single string too (`"role": "management"` works). Multiple roles stack — a user with both `product_owner` and `management` gets per-project PO reports **and** the company-wide report, and can run commands for any of their granted roles.
+- `projects` (required if `product_owner` in roles) — array of Jira project keys the PO owns. Uppercase.
 
+Role semantics:
+- **worker** — daily reminder DM, weekly personal summary.
+- **product_owner** — same as worker + weekly report per owned project + can query `/wl-project`, `/wl-subproject` for their projects via the Slack bot.
+- **management** — same as worker + weekly company-wide report + can query any worker/project/subproject via the Slack bot.
+
+Az `email` mező fontos a Google Calendar OoO funkcióhoz:
 - A Jira alapértelmezetten **rejti** az `emailAddress`-t privacy setting miatt.
-- A Slack `users.info` lookup működne, de `users:read.email` scope-ot igényel.
-- Az `email` mezővel a script **közvetlenül** tudja ki melyik Google calendar-t olvassa — nincs reliance external lookupra.
+- A Slack `users.info` lookup csak `users:read.email` scope-pal működne.
+- Az `email` mezővel a script **közvetlenül** tudja ki melyik Google calendar-t olvassa.
 
-Domain auto-normalizálás: a régi `@meloditech.com` címek automatikusan `@bpdata.com`-ra cserélődnek (lásd lentebb).
+Domain auto-normalizálás: a régi `@meloditech.com` címek automatikusan `@bpdata.com`-ra cserélődnek.
 
 **Jira Account ID megtalálása:**
 - Jira user profil URL-ben: `https://yoursite.atlassian.net/jira/people/ACCOUNT_ID`
@@ -138,6 +170,55 @@ A repo Settings → Secrets and variables → Actions → New repository secret:
 
 ## Futtatás
 
+### Slack bot (Socket Mode)
+
+A `bot.py` egy standalone Slack bot, ami slash parancsokra válaszol. Lásd a [time-management onboarding doc](docs/time-management.md#6-slack-bot) leírását a parancsokról.
+
+**Slack app setup — app manifest (automatizált):**
+
+A repo gyökerében lévő [`slack-manifest.yaml`](slack-manifest.yaml) tartalmazza az összes scope-ot, slash parancsot és Socket Mode beállítást. Egy paszta és a Slack mindent konfigurál — nincs kattintgatás.
+
+**Létező app frissítése:**
+
+1. https://api.slack.com/apps → válaszd ki a meglévő app-et.
+2. Bal menü → **Features → App Manifest**.
+3. Váltás **YAML** fülre → töröld a jelenlegit → paste the content of `slack-manifest.yaml` → **Save Changes**.
+4. A Slack figyelmeztet, ha új scope kell — fogadd el → **Reinstall to Workspace**.
+
+**Új app-nél (zöldmezős telepítés):**
+
+1. https://api.slack.com/apps → **Create New App** → **From an app manifest**.
+2. Workspace választás → paste `slack-manifest.yaml` → **Create**.
+3. **Install to Workspace**.
+
+**Tokenek összegyűjtése a manifest bepasztázás után:**
+
+- `SLACK_BOT_TOKEN` (xoxb-…): **OAuth & Permissions** → Bot User OAuth Token.
+- `SLACK_APP_TOKEN` (xapp-…): **Basic Information** → App-Level Tokens → *Generate Token and Scopes* → name: `socket-mode`, scope: `connections:write` → **Generate** → copy.
+
+Mindkettőt tedd a `.env`-be + Render Background Worker env-be.
+
+> **Miért két token?** A `xoxb-` a bot küldéseihez (posts, user lookup). A `xapp-` Socket Mode WebSocket-hez (a bot onnan *kapja* a slash parancsokat). A manifest bepasztázásával a bot scope-ok automatikusan beállnak, de az app-level token generálás külön gomb.
+
+**Futtatás:**
+
+```bash
+# minden env var ugyanaz mint a cron-hoz, plusz:
+export SLACK_APP_TOKEN="xapp-..."
+export OPENAI_API_KEY="sk-..."
+export OPENAI_MODEL="gpt-5-mini"  # optional
+
+python bot.py
+```
+
+Persistent process — nem cron. Fut amíg le nem állítod. Render-en **Background Worker** szolgáltatás (lásd lent).
+
+### AI összefoglalók
+
+A heti projekt/cég riportok OpenAI narratívát tartalmaznak a Jira ticket leírások + worklog comment-ek alapján. Model: `OPENAI_MODEL` env var (default `gpt-5-mini`).
+
+Ha `OPENAI_API_KEY` nincs beállítva, a riportok szövegesen készülnek el, csak a "(AI summary unavailable)" placeholderrel.
+
 ### Automatikus futtatás — Render Cron Jobs
 
 Az ütemezett futás **Render Cron Job**-okon keresztül történik (korábban GitHub Actions volt). A GitHub workflow megmarad, de csak manuális indításra (Actions → Jira Worklog Tracker → Run workflow).
@@ -169,7 +250,7 @@ Az ütemezett futás **Render Cron Job**-okon keresztül történik (korábban G
    A `.env` fájlban lévő értékeket másold ide 1:1-ben (egy sorban a JSON-öket is).
 5. **Create Cron Job**. A Render legyártja a service-t, futtatja a build-et és várja a következő cron trigger-t.
 
-**2. Második Cron Job — heti összesítő**
+**2. Második Cron Job — heti worker összesítő**
 
 Ismételd meg a fenti lépéseket az alábbi eltérésekkel:
 
@@ -177,6 +258,36 @@ Ismételd meg a fenti lépéseket az alábbi eltérésekkel:
 - **Schedule:** `45 14 * * 5`  *(péntek 14:45 UTC = 16:45 CEST / 15:45 CET)*
 - **Command:** `python worklog_tracker.py --weekly-summary`
 - **Env vars:** ugyanazok mint a daily.
+
+**3. Harmadik Cron Job — Heti PO + Management riport (hétfő reggel)**
+
+Egy cron futás csinál mindent: a múlt heti zárt adatokból generál projektenkénti AI narratívát (egyszer), majd kiküldi a POknak (csak a saját projektjeiket) és minden Management usernek (cégszintű cél riport, az összes projekt narratívájával). A projekt-narratíva **egyszer** megy GPT-nek projektenként, a többi címzett ugyanazt a cached választ kapja — minimum token costs.
+
+- **Name:** `jira-worklog-weekly-reports`
+- **Schedule:** `45 6 * * 1`  *(hétfő 06:45 UTC = 08:45 CEST / 07:45 CET — múlt heti (h-p) zárt hét)*
+- **Command:** `python worklog_tracker.py --po-reports --mgmt-reports --last-week`
+- **Env vars:** ugyanazok + `OPENAI_API_KEY` (AI összefoglalóhoz).
+
+Az `--last-week` 7 napot visszatol az anchort → hétfőn futtatva a kész előző Mon–Fri hetet dolgozza fel. Egy futás = egy cache = minden projekt pontosan egyszer megy GPT-be.
+
+**4. Background Worker — Slack bot**
+
+A bot persistent process, nem cron. Render Background Worker szolgáltatás kell:
+
+1. Dashboard → **New +** → **Background Worker**.
+2. Connect repo, Branch: `main`.
+3. **Name:** `jira-worklog-bot`
+4. **Region:** Frankfurt
+5. **Runtime:** Python
+6. **Build Command:** `pip install -r requirements.txt`
+7. **Start Command:** `python bot.py`
+8. **Env vars:** add all of the above **plus**:
+   - `SLACK_APP_TOKEN` (xapp-...)
+   - `OPENAI_API_KEY`
+   - `OPENAI_MODEL` (optional, default `gpt-5-mini`)
+9. **Create Background Worker**. A bot egyszer indul el és fut amíg újra nem indítod/deploy nem történik.
+
+A bot persistence → Background Worker díja alkalmazandó (Render Starter: $7/mo).
 
 Tipp: ha nem akarod mindegyik env var-t kétszer begépelni, használj Render **Environment Group**-ot:
 1. Dashboard → **Env Groups** → **New Environment Group** → add hozzá mind a 7 változót.
