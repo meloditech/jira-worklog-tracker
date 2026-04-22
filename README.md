@@ -259,16 +259,15 @@ Ismételd meg a fenti lépéseket az alábbi eltérésekkel:
 - **Command:** `python worklog_tracker.py --weekly-summary`
 - **Env vars:** ugyanazok mint a daily.
 
-**3. Harmadik Cron Job — Heti PO + Management riport (hétfő reggel)**
+**3. Heti PO + Management riport — a bot Background Worker scheduleli**
 
-Egy cron futás csinál mindent: a múlt heti zárt adatokból generál projektenkénti AI narratívát (egyszer), majd kiküldi a POknak (csak a saját projektjeiket) és minden Management usernek (cégszintű cél riport, az összes projekt narratívájával). A projekt-narratíva **egyszer** megy GPT-nek projektenként, a többi címzett ugyanazt a cached választ kapja — minimum token costs.
+Korábban külön Cron Job volt rá; most a bot process APScheduler-rel maga fut le **hétfő 06:45 UTC**-kor (`/wl-help` alatti riportokkal azonos logika). Indoka: a bot és a riport generátor ugyanabban a process-ben fut → a projektenkénti LLM cache megosztott, ezért minden projekt **pontosan egyszer** megy GPT-be, a POk + Management mind a cached választ kapják.
 
-- **Name:** `jira-worklog-weekly-reports`
-- **Schedule:** `45 6 * * 1`  *(hétfő 06:45 UTC = 08:45 CEST / 07:45 CET — múlt heti (h-p) zárt hét)*
-- **Command:** `python worklog_tracker.py --po-reports --mgmt-reports --last-week`
-- **Env vars:** ugyanazok + `OPENAI_API_KEY` (AI összefoglalóhoz).
-
-Az `--last-week` 7 napot visszatol az anchort → hétfőn futtatva a kész előző Mon–Fri hetet dolgozza fel. Egy futás = egy cache = minden projekt pontosan egyszer megy GPT-be.
+Ha külön cron-ként kéred (például ha a bot le van állítva), a parancs megmarad:
+```
+python worklog_tracker.py --po-reports --mgmt-reports --last-week
+```
+de a bot duplán küldene, ezért vagy letiltod a beépített scheduler-t környezeti változóval (`DISABLE_BOT_SCHEDULER=1` a bot worker-en), vagy lemondasz a cached megosztás előnyéről.
 
 **4. Background Worker — Slack bot**
 
@@ -288,6 +287,69 @@ A bot persistent process, nem cron. Render Background Worker szolgáltatás kell
 9. **Create Background Worker**. A bot egyszer indul el és fut amíg újra nem indítod/deploy nem történik.
 
 A bot persistence → Background Worker díja alkalmazandó (Render Starter: $7/mo).
+
+---
+
+## Deployment walkthrough (end-to-end)
+
+Assumes `.env` works locally, repo pushed to GitHub, Slack app manifest pasted & tokens captured.
+
+**1. Render account + repo connect**
+
+1. Create account → https://render.com
+2. Dashboard → **New +** → connect GitHub, authorize the repo.
+
+**2. Create shared Environment Group**
+
+1. Dashboard → **Env Groups** → **New Environment Group** → name `jira-worklog-env`.
+2. Add every `.env` variable (value exactly as local): `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN`, `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `USER_MAPPING`, `PROJECT_BLACKLIST`, `GOOGLE_SERVICE_ACCOUNT_JSON`, `OPENAI_API_KEY`, `OPENAI_MODEL`.
+3. Save. Both services below will link to this group.
+
+**3. Background Worker** (Slack bot + in-process scheduler for daily + weekly)
+
+1. **New +** → **Background Worker**. Region: Frankfurt.
+2. Runtime: Python. Build: `pip install -r requirements.txt`. Start: `python bot.py`.
+3. Environment → **Link Environment Group** → `jira-worklog-env`.
+4. Create. First deploy takes ~2 min.
+
+**4. Verify**
+
+- Background Worker → **Logs** tab → expect:
+  ```
+  [scheduler] started. Daily check: Mon-Fri 06:45 UTC. Weekly reports: Mon 06:45 UTC.
+  Starting Slack bot in Socket Mode...
+  ⚡️ Bolt app is running!
+  ```
+- In Slack, DM the bot `/wl-help` → should respond.
+
+**5. Stop the local bot.** Two Socket Mode clients on the same Slack app collide. Either Ctrl+C your local `python bot.py`, or use a separate dev Slack app (see below).
+
+---
+
+## Development best practice — two Slack apps
+
+You cannot run the local and production bot against the **same** Slack app — Socket Mode allows one active connection per app. Solution: separate dev app.
+
+**Setup (one-time):**
+
+1. https://api.slack.com/apps → **Create New App** → **From an app manifest**.
+2. Paste the same [`slack-manifest.yaml`](slack-manifest.yaml), change the `display_information.name` to e.g. `Jira Worklog Tracker (DEV)`.
+3. Create. Install to workspace.
+4. Capture its own `SLACK_BOT_TOKEN` + `SLACK_APP_TOKEN`.
+5. In your local `.env`, replace the prod tokens with the dev tokens. Production (Render) keeps prod tokens via the env group.
+
+**Optional: dev Slack workspace**
+
+For stronger isolation (so dev DMs don't pollute your team), create a free Slack workspace just for testing (`*.slack.com` → Create workspace). Install the dev app there. Real team workspace stays untouched.
+
+**Dev checklist:**
+
+- Local `bot.py` → uses dev tokens → only dev app fires → prod unaffected.
+- After a change: Ctrl+C + `python bot.py` (no hot-reload — Socket Mode clients don't reconnect automatically on source change).
+- Use `--dry-run` for reports: `python worklog_tracker.py --po-reports --mgmt-reports --last-week --dry-run` — prints to stdout, no Slack sends.
+- Disable scheduler while iterating: `DISABLE_BOT_SCHEDULER=1 python bot.py` — skips the Monday job registration.
+
+**Branch → preview?** Render supports preview environments for Web Services but not for Background Workers as of now. Stick with the two-app approach.
 
 Tipp: ha nem akarod mindegyik env var-t kétszer begépelni, használj Render **Environment Group**-ot:
 1. Dashboard → **Env Groups** → **New Environment Group** → add hozzá mind a 7 változót.

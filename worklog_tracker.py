@@ -668,6 +668,131 @@ def build_weekly_summary_message(person_data, week_start, week_end, ooo_info=Non
     return "\n".join(lines)
 
 
+def run_daily_check(
+    jira_base_url, jira_email, jira_api_token,
+    slack_client, user_mapping, blacklisted_projects,
+    date_str, dry_run=False, google_sa_info=None,
+):
+    """Daily worker worklog check. Sends DM if logged < 8h (adjusted for OoO)."""
+    print(f"Checking worklogs for {date_str}...")
+    people = get_jira_worklogs(jira_base_url, jira_email, jira_api_token, date_str, blacklisted_projects)
+
+    print(f"\nFound {len(people)} people with worklogs:")
+    for account_id, data in people.items():
+        print(f"  {data['name']}: {format_hours(data['total_seconds'])}")
+
+    notified = 0
+    skipped = 0
+
+    for jira_id, entry in user_mapping.items():
+        slack_id = entry["slack"]
+        person = people.get(jira_id)
+        total_seconds = person["total_seconds"] if person else 0
+
+        active_issues = get_active_issues(jira_base_url, jira_email, jira_api_token, jira_id, blacklisted_projects)
+
+        ooo_info = None
+        if google_sa_info:
+            user_email = entry.get("email")
+            if not user_email:
+                user_email = get_user_email(jira_base_url, jira_email, jira_api_token, jira_id)
+            if not user_email and slack_id:
+                try:
+                    info = slack_client.users_info(user=slack_id)
+                    user_email = info["user"]["profile"].get("email")
+                except SlackApiError as e:
+                    print(f"  Slack users_info fallback failed for {slack_id}: {e.response['error']}")
+            if user_email:
+                ooo_info = get_ooo_events(google_sa_info, user_email, date_str, date_str)
+            else:
+                print(f"  No email resolvable for {jira_id} → skipping OoO fetch")
+
+        vacation_seconds = 0
+        if ooo_info and date_str in ooo_info.get("vacation_days", []):
+            vacation_seconds = 8 * 3600
+        is_ok = (total_seconds + vacation_seconds) >= 8 * 3600
+
+        if person:
+            name = person["name"]
+            message = build_slack_message(person, date_str, active_issues, ooo_info)
+        else:
+            name = jira_id
+            person_data = {"total_seconds": 0, "tickets": {}}
+            message = build_slack_message(person_data, date_str, active_issues, ooo_info)
+
+        status = "OK" if is_ok else "UNDER 8h"
+        vac_note = f" (+{format_hours(vacation_seconds)} vacation)" if vacation_seconds else ""
+        print(f"\n{name}: {format_hours(total_seconds)}{vac_note} - {status}")
+        send_slack_dm(slack_client, slack_id, message, dry_run=dry_run)
+
+        if is_ok:
+            skipped += 1
+        else:
+            notified += 1
+
+    print(f"\nDone! Under 8h: {notified}, OK: {skipped}")
+
+
+def run_weekly_reports(
+    jira_base_url, jira_email, jira_api_token,
+    slack_client, user_mapping, blacklisted_projects, anchor_date,
+    do_po=True, do_mgmt=True, dry_run=False,
+):
+    """Send weekly PO + Management reports for the week containing `anchor_date`.
+
+    Reused by both the CLI (`--po-reports --mgmt-reports`) and the bot's
+    in-process APScheduler. Running PO then Mgmt in one process keeps the
+    per-project LLM cache warm — each project is summarized exactly once.
+    """
+    import reports
+    week_start, week_end = reports.week_range(anchor_date)
+    print(f"Building reports for week {week_start} – {week_end}...")
+
+    all_projects = reports.get_all_projects(jira_base_url, jira_email, jira_api_token)
+    project_desc_map = {p["key"]: p["description"] for p in all_projects}
+    project_name_map = {p["key"]: p["name"] for p in all_projects}
+
+    if do_po:
+        pos = find_users_by_role(user_mapping, "product_owner")
+        print(f"Found {len(pos)} Product Owner(s).")
+        for po_jid, po in pos.items():
+            po_projects = [p for p in po.get("projects", []) if p not in blacklisted_projects]
+            if not po_projects:
+                print(f"  PO {po_jid} has no projects; skipping.")
+                continue
+            for project_key in po_projects:
+                issues = reports.get_project_worklogs(
+                    jira_base_url, jira_email, jira_api_token,
+                    [project_key], week_start, week_end,
+                )
+                message = reports.build_project_report(
+                    project_key,
+                    project_name_map.get(project_key, project_key),
+                    project_desc_map.get(project_key, ""),
+                    issues, week_start, week_end,
+                )
+                print(f"\nPO {po['slack']}: project {project_key} ({len(issues)} issues)")
+                send_slack_dm(slack_client, po["slack"], message, dry_run=dry_run)
+
+    if do_mgmt:
+        mgmt_users = find_users_by_role(user_mapping, "management")
+        print(f"Found {len(mgmt_users)} Management user(s).")
+        all_keys = [p["key"] for p in all_projects if p["key"] not in blacklisted_projects]
+        issues = reports.get_project_worklogs(
+            jira_base_url, jira_email, jira_api_token,
+            all_keys, week_start, week_end,
+        )
+        message = reports.build_company_report(
+            issues, week_start, week_end,
+            project_descriptions=project_desc_map,
+        )
+        for mgr_jid, mgr in mgmt_users.items():
+            print(f"\nManagement {mgr['slack']}: company-wide report")
+            send_slack_dm(slack_client, mgr["slack"], message, dry_run=dry_run)
+
+    print(f"\nLLM cache: {reports.llm_cache_stats()}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Jira Worklog Tracker")
     parser.add_argument(
@@ -937,60 +1062,17 @@ def main():
     slack_client = WebClient(token=slack_bot_token, ssl=ssl_context)
 
     if args.po_reports or args.mgmt_reports:
-        import reports  # lazy import — only needed for these modes
         today = date.today()
         if args.date:
             today = date.fromisoformat(args.date)
         if args.last_week:
             today = today - timedelta(days=7)
-        week_start, week_end = reports.week_range(today)
-        print(f"Building reports for week {week_start} – {week_end}...")
-
-        # Collect project descriptions once
-        all_projects = reports.get_all_projects(jira_base_url, jira_email, jira_api_token)
-        project_desc_map = {p["key"]: p["description"] for p in all_projects}
-        project_name_map = {p["key"]: p["name"] for p in all_projects}
-
-        if args.po_reports:
-            pos = find_users_by_role(user_mapping, "product_owner")
-            print(f"Found {len(pos)} Product Owner(s).")
-            for po_jid, po in pos.items():
-                po_projects = [p for p in po.get("projects", []) if p not in blacklisted_projects]
-                if not po_projects:
-                    print(f"  PO {po_jid} has no projects; skipping.")
-                    continue
-                for project_key in po_projects:
-                    issues = reports.get_project_worklogs(
-                        jira_base_url, jira_email, jira_api_token,
-                        [project_key], week_start, week_end,
-                    )
-                    message = reports.build_project_report(
-                        project_key,
-                        project_name_map.get(project_key, project_key),
-                        project_desc_map.get(project_key, ""),
-                        issues, week_start, week_end,
-                    )
-                    print(f"\nPO {po['slack']}: project {project_key} ({len(issues)} issues)")
-                    send_slack_dm(slack_client, po["slack"], message, dry_run=args.dry_run)
-
-        if args.mgmt_reports:
-            mgmt_users = find_users_by_role(user_mapping, "management")
-            print(f"Found {len(mgmt_users)} Management user(s).")
-            # Gather all non-blacklisted project keys to scope the search
-            all_keys = [p["key"] for p in all_projects if p["key"] not in blacklisted_projects]
-            issues = reports.get_project_worklogs(
-                jira_base_url, jira_email, jira_api_token,
-                all_keys, week_start, week_end,
-            )
-            message = reports.build_company_report(
-                issues, week_start, week_end,
-                project_descriptions=project_desc_map,
-            )
-            for mgr_jid, mgr in mgmt_users.items():
-                print(f"\nManagement {mgr['slack']}: company-wide report")
-                send_slack_dm(slack_client, mgr["slack"], message, dry_run=args.dry_run)
-
-        print(f"\nLLM cache: {reports.llm_cache_stats()}")
+        run_weekly_reports(
+            jira_base_url, jira_email, jira_api_token,
+            slack_client, user_mapping, blacklisted_projects, today,
+            do_po=args.po_reports, do_mgmt=args.mgmt_reports,
+            dry_run=args.dry_run,
+        )
         return
 
     if args.weekly_summary:
@@ -1048,66 +1130,12 @@ def main():
         print(f"\nWeekly summary sent to {len(user_mapping)} people.")
         return
 
-    print(f"Checking worklogs for {date_str}...")
-
-    # Fetch worklogs from Jira
-    people = get_jira_worklogs(jira_base_url, jira_email, jira_api_token, date_str, blacklisted_projects)
-
-    print(f"\nFound {len(people)} people with worklogs:")
-    for account_id, data in people.items():
-        print(f"  {data['name']}: {format_hours(data['total_seconds'])}")
-
-    # Check each mapped user
-    notified = 0
-    skipped = 0
-
-    for jira_id, entry in user_mapping.items():
-        slack_id = entry["slack"]
-        person = people.get(jira_id)
-        total_seconds = person["total_seconds"] if person else 0
-
-        active_issues = get_active_issues(jira_base_url, jira_email, jira_api_token, jira_id, blacklisted_projects)
-
-        ooo_info = None
-        if google_sa_info:
-            user_email = entry.get("email")
-            if not user_email:
-                user_email = get_user_email(jira_base_url, jira_email, jira_api_token, jira_id)
-            if not user_email and slack_id:
-                try:
-                    info = slack_client.users_info(user=slack_id)
-                    user_email = info["user"]["profile"].get("email")
-                except SlackApiError as e:
-                    print(f"  Slack users_info fallback failed for {slack_id}: {e.response['error']}")
-            if user_email:
-                ooo_info = get_ooo_events(google_sa_info, user_email, date_str, date_str)
-            else:
-                print(f"  No email resolvable for {jira_id} → skipping OoO fetch")
-
-        vacation_seconds = 0
-        if ooo_info and date_str in ooo_info.get("vacation_days", []):
-            vacation_seconds = 8 * 3600
-        is_ok = (total_seconds + vacation_seconds) >= 8 * 3600
-
-        if person:
-            name = person["name"]
-            message = build_slack_message(person, date_str, active_issues, ooo_info)
-        else:
-            name = jira_id
-            person_data = {"total_seconds": 0, "tickets": {}}
-            message = build_slack_message(person_data, date_str, active_issues, ooo_info)
-
-        status = "OK" if is_ok else "UNDER 8h"
-        vac_note = f" (+{format_hours(vacation_seconds)} vacation)" if vacation_seconds else ""
-        print(f"\n{name}: {format_hours(total_seconds)}{vac_note} - {status}")
-        send_slack_dm(slack_client, slack_id, message, dry_run=args.dry_run)
-
-        if is_ok:
-            skipped += 1
-        else:
-            notified += 1
-
-    print(f"\nDone! Under 8h: {notified}, OK: {skipped}")
+    run_daily_check(
+        jira_base_url, jira_email, jira_api_token,
+        slack_client, user_mapping, blacklisted_projects,
+        date_str, dry_run=args.dry_run,
+        google_sa_info=google_sa_info,
+    )
 
 
 if __name__ == "__main__":

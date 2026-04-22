@@ -42,6 +42,7 @@ from worklog_tracker import (
     find_user_by_slack,
     find_po_for_project,
     format_hours,
+    run_weekly_reports,
 )
 
 
@@ -428,9 +429,74 @@ def _display_name(command):
     return command.get("user_name")
 
 
+# -- scheduled weekly reports (in-process) ---------------------------------
+
+def _scheduled_weekly_reports():
+    """Fire weekly PO + Management reports for the just-completed week.
+    Runs in the same process as the bot → shares the LLM cache. Each
+    project is summarized exactly once per week, regardless of how many
+    POs/Managers receive it.
+    """
+    from datetime import timedelta
+    print("\n[scheduler] Weekly reports trigger fired.")
+    anchor = date.today() - timedelta(days=7)  # previous week's Monday via week_range()
+    run_weekly_reports(
+        JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN,
+        app.client, USER_MAPPING, BLACKLIST, anchor,
+        do_po=True, do_mgmt=True, dry_run=False,
+    )
+
+
+def _scheduled_daily_check():
+    """Fire daily worklog reminder for the previous workday."""
+    from datetime import timedelta
+    from worklog_tracker import run_daily_check
+    print("\n[scheduler] Daily worklog check fired.")
+    today = date.today()
+    wd = today.weekday()
+    if wd == 0:
+        anchor = today - timedelta(days=3)
+    elif wd == 6:
+        anchor = today - timedelta(days=2)
+    else:
+        anchor = today - timedelta(days=1)
+    run_daily_check(
+        JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN,
+        app.client, USER_MAPPING, BLACKLIST,
+        anchor.isoformat(), dry_run=False,
+    )
+
+
+def _start_scheduler():
+    """Background APScheduler — runs on the bot's event loop thread."""
+    if os.environ.get("DISABLE_BOT_SCHEDULER", "").lower() in {"1", "true", "yes"}:
+        print("[scheduler] disabled via DISABLE_BOT_SCHEDULER")
+        return
+    from apscheduler.schedulers.background import BackgroundScheduler
+    from apscheduler.triggers.cron import CronTrigger
+    sched = BackgroundScheduler(timezone="UTC")
+    sched.add_job(
+        _scheduled_daily_check,
+        CronTrigger(day_of_week="mon-fri", hour=6, minute=45),
+        id="daily_check",
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
+    sched.add_job(
+        _scheduled_weekly_reports,
+        CronTrigger(day_of_week="mon", hour=6, minute=45),
+        id="weekly_reports",
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
+    sched.start()
+    print("[scheduler] started. Daily check: Mon-Fri 06:45 UTC. Weekly reports: Mon 06:45 UTC.")
+
+
 # -- entrypoint -------------------------------------------------------------
 
 def main():
+    _start_scheduler()
     print("Starting Slack bot in Socket Mode...")
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
     handler.start()
