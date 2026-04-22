@@ -33,10 +33,25 @@ except ImportError:
 GOOGLE_CALENDAR_SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
 
 
-def get_env(name):
+def get_env(name, required=True):
+    """Read a config value. Prefers a file path pointed at by `{name}_FILE`
+    (Render Secret Files / Docker secrets), falls back to the inline env var.
+    Big JSON blobs (USER_MAPPING, GOOGLE_SERVICE_ACCOUNT_JSON) should live in
+    Secret Files to keep the environment group manageable.
+    """
+    path = os.environ.get(f"{name}_FILE")
+    if path and os.path.isfile(path):
+        try:
+            with open(path, "r") as f:
+                return f.read().strip()
+        except OSError as e:
+            print(f"Error reading {name}_FILE={path}: {e}")
+            sys.exit(1)
     value = os.environ.get(name)
     if not value:
-        print(f"Error: {name} environment variable is not set")
+        if not required:
+            return None
+        print(f"Error: {name} not set (neither env var nor {name}_FILE)")
         sys.exit(1)
     return value
 
@@ -930,7 +945,7 @@ def main():
 
     # Optional: Google service account JSON for OoO event detection
     google_sa_info = None
-    google_sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    google_sa_json = (get_env("GOOGLE_SERVICE_ACCOUNT_JSON", required=False) or "").strip()
     if google_sa_json:
         if not GOOGLE_AVAILABLE:
             print("Warning: GOOGLE_SERVICE_ACCOUNT_JSON set but google libs not installed.")

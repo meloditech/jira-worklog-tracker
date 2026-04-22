@@ -302,8 +302,27 @@ Assumes `.env` works locally, repo pushed to GitHub, Slack app manifest pasted &
 **2. Create shared Environment Group**
 
 1. Dashboard → **Env Groups** → **New Environment Group** → name `jira-worklog-env`.
-2. Add every `.env` variable (value exactly as local): `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN`, `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `USER_MAPPING`, `PROJECT_BLACKLIST`, `GOOGLE_SERVICE_ACCOUNT_JSON`, `OPENAI_API_KEY`, `OPENAI_MODEL`.
-3. Save. Both services below will link to this group.
+2. Add the **short** variables: `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN`, `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `PROJECT_BLACKLIST`, `OPENAI_API_KEY`, `OPENAI_MODEL`.
+3. Save. Services link to this group.
+
+**2a. Big configs via Render Secret Files (recommended)**
+
+`USER_MAPPING` and `GOOGLE_SERVICE_ACCOUNT_JSON` are long single-line JSON blobs — pasting them into the Environment Group UI becomes unreadable. Render supports **Secret Files**: mount a multi-line file into the service at a fixed path.
+
+For each service (Background Worker, and any Cron Job that needs them):
+
+1. Service → **Environment** → scroll to **Secret Files** → **Add Secret File**.
+2. **Filename:** `user_mapping.json`
+   **Contents:** paste the JSON with real newlines + indentation for readability.
+3. **Add Secret File** again:
+   **Filename:** `google_service_account.json`
+   **Contents:** paste the full service account key JSON.
+4. In the Environment Group (or service-level env override), add two **pointer** env vars:
+   - `USER_MAPPING_FILE=/etc/secrets/user_mapping.json`
+   - `GOOGLE_SERVICE_ACCOUNT_JSON_FILE=/etc/secrets/google_service_account.json`
+5. You can now **remove** `USER_MAPPING` and `GOOGLE_SERVICE_ACCOUNT_JSON` from the env group.
+
+The script auto-detects the `_FILE` suffix: if the file exists, its contents are read; otherwise the inline env var is used. Local dev stays on `.env`; prod uses Secret Files.
 
 **3. Background Worker** (Slack bot + in-process scheduler for daily + weekly)
 

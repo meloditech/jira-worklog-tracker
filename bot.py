@@ -49,9 +49,18 @@ from worklog_tracker import (
 # -- env + mapping ----------------------------------------------------------
 
 def env(name, required=True):
+    """Read config via Secret File path at `{name}_FILE`, falling back to env var."""
+    path = os.environ.get(f"{name}_FILE")
+    if path and os.path.isfile(path):
+        try:
+            with open(path, "r") as f:
+                return f.read().strip()
+        except OSError as e:
+            print(f"Error reading {name}_FILE={path}: {e}")
+            sys.exit(1)
     v = os.environ.get(name)
     if required and not v:
-        print(f"Error: {name} not set")
+        print(f"Error: {name} not set (env or {name}_FILE)")
         sys.exit(1)
     return v
 
