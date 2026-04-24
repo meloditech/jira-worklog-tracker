@@ -237,14 +237,16 @@ def normalize_user_mapping(raw):
        - extended: {jira_id: {"slack": "SLACK", "email": "...",
                               "role": "worker"|"product_owner"|"management"
                                       | ["product_owner", "management"],
-                              "projects": ["LIP", "IN"]}}
+                              "projects": ["LIP", "IN"],
+                              "skip_daily_reminder": true}}
 
-    Returns {jira_id: {"slack", "email", "roles": [..], "projects": [..]}}.
+    Returns {jira_id: {"slack", "email", "roles": [..], "projects": [..],
+                       "skip_daily_reminder": bool}}.
     """
     out = {}
     for jira_id, val in raw.items():
         if isinstance(val, str):
-            out[jira_id] = {"slack": val, "email": None, "roles": ["worker"], "projects": []}
+            out[jira_id] = {"slack": val, "email": None, "roles": ["worker"], "projects": [], "skip_daily_reminder": False}
         elif isinstance(val, dict):
             slack_id = val.get("slack") or val.get("slack_id")
             if not slack_id:
@@ -261,6 +263,7 @@ def normalize_user_mapping(raw):
                 "email": val.get("email"),
                 "roles": roles,
                 "projects": [p.upper() for p in projects if isinstance(p, str)],
+                "skip_daily_reminder": bool(val.get("skip_daily_reminder", False)),
             }
         else:
             print(f"Warning: unexpected USER_MAPPING value for {jira_id}: {val!r}")
@@ -700,6 +703,10 @@ def run_daily_check(
     skipped = 0
 
     for jira_id, entry in user_mapping.items():
+        if entry.get("skip_daily_reminder"):
+            print(f"  Skipping daily reminder for {entry.get('email') or jira_id} (skip_daily_reminder=true)")
+            skipped += 1
+            continue
         slack_id = entry["slack"]
         person = people.get(jira_id)
         total_seconds = person["total_seconds"] if person else 0
